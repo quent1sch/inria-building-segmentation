@@ -1,0 +1,56 @@
+# configs/config.yaml
+# All hyperparameters in one place — edit here, not in code.
+
+data:
+  patches_dir: "data/patches"
+  val_cities: ["vienna"]          # held-out cities for validation
+  image_size: 512
+  # ImageNet normalization (encoder is pretrained on ImageNet)
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+model:
+  encoder: "resnet34"
+  encoder_weights: "imagenet"
+  in_channels: 3
+  classes: 1                      # binary segmentation
+
+training:
+  epochs: 2                       # 50 epochs is reasonable
+  batch_size: 2                   # reduce to 4 on CPU/low RAM, 8 otherwise
+  num_workers: 4                  # set to 0 on Windows
+  weight_decay: 1.0e-4
+  dice_weight: 0.5
+  bce_weight: 0.5
+  early_stopping_patience: 10
+  checkpoint_dir: "checkpoints"
+  best_model_name: "best_model.pth"
+
+  # ── Two-phase fine-tuning ──────────────────────────────────────────────
+  # Phase 1 (warmup): encoder frozen, only decoder trains.
+  #   Stabilises the decoder before the encoder starts moving.
+  # Phase 2 (fine-tune): encoder unfrozen with a lower lr (encoder_lr)
+  #   so pretrained features adapt slowly (differential learning rates).
+  warmup_epochs: 1                # number of epochs for phase 1 (10 warmup epochs is reasonable)
+  encoder_lr: 1.0e-5              # phase 2 encoder lr  (10× lower than decoder)
+  decoder_lr: 1.0e-4              # decoder + head lr   (both phases)
+
+  # CosineAnnealingLR restarts from decoder_lr after warmup ends.
+  # T_max covers only phase 2 epochs so the cosine cycle fits the run.
+  scheduler: "cosine"             # cosine | none
+
+  # ── Test-Time Augmentation ────────────────────────────────────────────
+  # TTA at validation gives a more realistic estimate of deployment perf.
+  # 8× slower per val epoch — disable if iteration speed matters more.
+  tta_val: false                  # enable TTA during validation loop
+  tta_eval: true                  # always use TTA in evaluate.py
+
+mlflow:
+  experiment_name: "inria-building-segmentation"
+  tracking_uri: "sqlite:///mlruns.db"   # SQLite backend (file-store deprecated in recent MLflow)
+
+inference:
+  tile_size: 512
+  overlap: 128                    # sliding-window overlap in pixels
+  threshold: 0.5                  # sigmoid threshold for binary mask
+  tta: true                       # use TTA for API inference
