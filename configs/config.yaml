@@ -16,8 +16,8 @@ model:
   classes: 1                      # binary segmentation
 
 training:
-  epochs: 2                       # 50 epochs is reasonable
-  batch_size: 2                   # reduce to 4 on CPU/low RAM, 8 otherwise
+  epochs: 50                      # 50 epochs is reasonable
+  batch_size: 8                   # reduce to 4 on CPU/low RAM, 8 otherwise
   num_workers: 4                  # set to 0 on Windows
   weight_decay: 1.0e-4
   dice_weight: 0.5
@@ -31,7 +31,7 @@ training:
   #   Stabilises the decoder before the encoder starts moving.
   # Phase 2 (fine-tune): encoder unfrozen with a lower lr (encoder_lr)
   #   so pretrained features adapt slowly (differential learning rates).
-  warmup_epochs: 1                # number of epochs for phase 1 (10 warmup epochs is reasonable)
+  warmup_epochs: 10               # number of epochs for phase 1 (10 warmup epochs is reasonable)
   encoder_lr: 1.0e-5              # phase 2 encoder lr  (10× lower than decoder)
   decoder_lr: 1.0e-4              # decoder + head lr   (both phases)
 
