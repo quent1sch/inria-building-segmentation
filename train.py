@@ -25,10 +25,19 @@ Optionally enabled during validation (tta_val: true in config).
 Always recommended for the final evaluate.py run (tta_eval: true).
 8 geometric variants (4 rotations × 2 flips) are averaged.
 
+Resuming after interruption
+----------------------------
+  python train.py --resume checkpoints/last_checkpoint.pth
+
+  Restores: model weights, optimizer state, scheduler state, best IoU,
+  patience counter, and the MLflow run ID so metrics continue on the
+  same run rather than starting a new one.
+
 Usage
 -----
-python train.py                          # uses configs/config.yaml
-python train.py --config my_config.yaml
+python train.py                                             # fresh run
+python train.py --config my_config.yaml                     # custom config
+python train.py --resume checkpoints/last_checkpoint.pth    # resume
 """
 
 import argparse
@@ -77,7 +86,7 @@ def compute_metrics(
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> dict:
-    preds = (torch.sigmoid(logits) > threshold).float().squeeze(1)  # (B, H, W)
+    preds   = (torch.sigmoid(logits) > threshold).float().squeeze(1) # (B, H, W)
     targets = targets.float()
 
     tp = (preds * targets).sum(dim=(1, 2))
@@ -91,10 +100,10 @@ def compute_metrics(
     recall    = (tp + smooth) / (tp + fn + smooth)
 
     return {
-        "iou": iou.mean().item(),
-        "dice": dice.mean().item(),
+        "iou":       iou.mean().item(),
+        "dice":      dice.mean().item(),
         "precision": precision.mean().item(),
-        "recall": recall.mean().item(),
+        "recall":    recall.mean().item(),
     }
 
 
@@ -102,7 +111,7 @@ def compute_metrics(
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
     model.train()
-    total_loss = 0.0
+    total_loss  = 0.0
     metrics_sum = {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0}
 
     for images, masks in tqdm(loader, desc="  Train", leave=False):
@@ -111,15 +120,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():
                 logits = model(images)
-                loss = criterion(logits, masks)
+                loss   = criterion(logits, masks)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(images)
-            loss = criterion(logits, masks)
+            loss   = criterion(logits, masks)
             loss.backward()
             optimizer.step()
 
@@ -136,7 +145,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
 @torch.no_grad()
 def validate(model, loader, criterion, device, use_tta: bool = False):
     model.eval()
-    total_loss = 0.0
+    total_loss  = 0.0
     metrics_sum = {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0}
 
     for images, masks in tqdm(loader, desc="  Val  ", leave=False):
@@ -151,7 +160,7 @@ def validate(model, loader, criterion, device, use_tta: bool = False):
 
         if use_tta:
             # TTA: binary predictions averaged over 8 augmentations
-            preds = model.predict_tta(images).float().squeeze(1)   # (B, H, W)
+            preds   = model.predict_tta(images).float().squeeze(1) # (B, H, W)
             targets = masks.float()
             tp = (preds * targets).sum(dim=(1, 2))
             fp = (preds * (1 - targets)).sum(dim=(1, 2))
@@ -173,7 +182,7 @@ def validate(model, loader, criterion, device, use_tta: bool = False):
     return total_loss / n, {k: v / n for k, v in metrics_sum.items()}
 
 
-# ── lr helpers ────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def get_lrs(optimizer) -> dict:
     """Return current lr for each named param group."""
@@ -183,11 +192,36 @@ def get_lrs(optimizer) -> dict:
     }
 
 
+def build_phase2_optimizer_and_scheduler(model, t_cfg, phase2_epochs, last_epoch=-1):
+    """
+    Build the phase 2 optimizer + cosine scheduler.
+    last_epoch lets the scheduler resume mid-cosine-cycle correctly.
+    """
+    optimizer = model.make_optimizer(
+        encoder_lr=t_cfg["encoder_lr"],
+        decoder_lr=t_cfg["decoder_lr"],
+        weight_decay=t_cfg["weight_decay"],
+    )
+    scheduler = None
+    if t_cfg["scheduler"] == "cosine" and phase2_epochs > 0:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=phase2_epochs, eta_min=1e-6,
+            last_epoch=last_epoch,
+        )
+    return optimizer, scheduler
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to a checkpoint to resume from (e.g. checkpoints/last_checkpoint.pth)",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -196,7 +230,7 @@ def main():
     # ── device ───────────────────────────────────────────────────────────
     device  = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = device == "cuda"
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler  = torch.amp.GradScaler('cuda') if use_amp else None
     print(f"Device: {device}  |  AMP: {use_amp}")
 
     # ── data ─────────────────────────────────────────────────────────────
@@ -210,12 +244,12 @@ def main():
     mean, std, size = cfg["data"]["mean"], cfg["data"]["std"], cfg["data"]["image_size"]
 
     train_ds = InriaDataset(
-        patches_dir=cfg["data"]["patches_dir"], 
+        cfg["data"]["patches_dir"], 
         cities=train_cities,
         transform=get_train_transforms(image_size=size, mean=mean, std=std),
     )
     val_ds = InriaDataset(
-        patches_dir=cfg["data"]["patches_dir"], 
+        cfg["data"]["patches_dir"], 
         cities=val_cities,
         transform=get_val_transforms(image_size=size, mean=mean, std=std),
     )
@@ -236,78 +270,133 @@ def main():
         pin_memory=(device == "cuda"),
     )
 
-    # ── model ────────────────────────────────────────────────────────────
-    model = UNetBuilding(
-        encoder_name=cfg["model"]["encoder"],
-        encoder_weights=cfg["model"]["encoder_weights"],
-        in_channels=cfg["model"]["in_channels"],
-    ).to(device)
-
     # ── fine-tuning config ────────────────────────────────────────────────
-    t_cfg        = cfg["training"]
+    t_cfg         = cfg["training"]
     warmup_epochs = t_cfg["warmup_epochs"]
     total_epochs  = t_cfg["epochs"]
     encoder_lr    = t_cfg["encoder_lr"]
     decoder_lr    = t_cfg["decoder_lr"]
     use_tta_val   = t_cfg.get("tta_val", False)
-
-    # ── phase 1 setup: freeze encoder, decoder-only optimizer ────────────
-    print(f"\nPhase 1 — warmup ({warmup_epochs} epochs): encoder frozen, decoder lr={decoder_lr}")
-    model.freeze_encoder()
-
-    # During warmup the encoder is frozen so we only pass decoder+head params.
-    # We still use make_optimizer() for consistency but encoder_lr is unused
-    # (frozen params don't receive gradients regardless of lr).
-    optimizer = model.make_optimizer(
-        encoder_lr=encoder_lr,
-        decoder_lr=decoder_lr,
-        weight_decay=t_cfg["weight_decay"],
-    )
-
-    # Phase 2 scheduler — cosine over phase 2 epochs only
     phase2_epochs = total_epochs - warmup_epochs
-    if t_cfg["scheduler"] == "cosine" and phase2_epochs > 0:
-        # Will be created at the start of phase 2
-        scheduler = None
-    else:
-        scheduler = None
 
     criterion = DiceBCELoss(
         dice_weight=t_cfg["dice_weight"],
         bce_weight=t_cfg["bce_weight"],
     )
 
+    checkpoint_dir = Path(t_cfg["checkpoint_dir"])
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── resume or fresh start ─────────────────────────────────────────────
+    start_epoch      = 1
+    best_iou         = 0.0
+    patience_counter = 0
+    resume_run_id    = None   # MLflow run to continue logging into
+    scheduler        = None
+
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        print(f"\nResuming from checkpoint: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+
+        # ── restore model ────────────────────────────────────────────────
+        model_cfg = checkpoint.get("model_config", {})
+        model = UNetBuilding(
+            encoder_name=model_cfg.get("encoder", cfg["model"]["encoder"]),
+            encoder_weights=None,       # weights come from checkpoint
+            in_channels=model_cfg.get("in_channels", cfg["model"]["in_channels"]),
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # ── restore training state ───────────────────────────────────────
+        start_epoch      = checkpoint["epoch"] + 1
+        best_iou         = checkpoint.get("best_iou", 0.0)
+        patience_counter = checkpoint.get("patience_counter", 0)
+        resume_run_id    = checkpoint.get("mlflow_run_id", None)
+
+        # ── restore optimizer + scheduler ────────────────────────────────
+        resumed_in_phase2 = start_epoch > warmup_epochs
+
+        if resumed_in_phase2:
+            model.unfreeze_encoder()
+            # How many phase2 steps have already run — tells cosine where it is
+            steps_done = start_epoch - warmup_epochs - 1
+            optimizer, scheduler = build_phase2_optimizer_and_scheduler(
+                model, t_cfg, phase2_epochs, last_epoch=steps_done
+            )
+        else:
+            model.freeze_encoder()
+            optimizer = model.make_optimizer(
+                encoder_lr=encoder_lr,
+                decoder_lr=decoder_lr,
+                weight_decay=t_cfg["weight_decay"],
+            )
+
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        print(f"  Resuming from epoch {start_epoch}/{total_epochs}")
+        print(f"  Best IoU so far : {best_iou:.4f}")
+        print(f"  Patience counter: {patience_counter}/{t_cfg['early_stopping_patience']}")
+        print(f"  Phase           : {'2 (fine-tuning)' if resumed_in_phase2 else '1 (warmup)'}")
+
+    else:
+        # ── fresh start ──────────────────────────────────────────────────
+        model = UNetBuilding(
+            encoder_name=cfg["model"]["encoder"],
+            encoder_weights=cfg["model"]["encoder_weights"],
+            in_channels=cfg["model"]["in_channels"],
+        ).to(device)
+
+        # ── phase 1 setup: freeze encoder, decoder-only optimizer ────────────
+        print(f"\nPhase 1 — warmup ({warmup_epochs} epochs): encoder frozen, decoder lr={decoder_lr}")
+        model.freeze_encoder()
+
+        # During warmup the encoder is frozen so we only pass decoder+head params.
+        # We still use make_optimizer() for consistency but encoder_lr is unused
+        # (frozen params don't receive gradients regardless of lr).
+        optimizer = model.make_optimizer(
+            encoder_lr=encoder_lr,
+            decoder_lr=decoder_lr,
+            weight_decay=t_cfg["weight_decay"],
+        )
+
     # ── MLflow ───────────────────────────────────────────────────────────
     mlflow.set_tracking_uri(cfg["mlflow"]["tracking_uri"])
     mlflow.set_experiment(cfg["mlflow"]["experiment_name"])
 
-    checkpoint_dir = Path(t_cfg["checkpoint_dir"])
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # Resume into the same MLflow run so charts stay continuous
+    run_kwargs = {"run_id": resume_run_id} if resume_run_id else {}
 
-    best_iou        = 0.0
-    patience_counter = 0
-    patience         = t_cfg["early_stopping_patience"]
+    with mlflow.start_run(**run_kwargs) as run:
 
-    with mlflow.start_run():
-        mlflow.log_params({
-            "encoder":        cfg["model"]["encoder"],
-            "encoder_weights": cfg["model"]["encoder_weights"],
-            "epochs":         total_epochs,
-            "warmup_epochs":  warmup_epochs,
-            "encoder_lr":     encoder_lr,
-            "decoder_lr":     decoder_lr,
-            "weight_decay":   t_cfg["weight_decay"],
-            "batch_size":     t_cfg["batch_size"],
-            "dice_weight":    t_cfg["dice_weight"],
-            "bce_weight":     t_cfg["bce_weight"],
-            "image_size":     size,
-            "tta_val":        use_tta_val,
-            "train_cities":   str(train_cities),
-            "val_cities":     str(val_cities),
-            "device":         device,
-        })
+        if not args.resume:
+            mlflow.log_params({
+                "encoder":         cfg["model"]["encoder"],
+                "encoder_weights": cfg["model"]["encoder_weights"],
+                "epochs":          total_epochs,
+                "warmup_epochs":   warmup_epochs,
+                "encoder_lr":      encoder_lr,
+                "decoder_lr":      decoder_lr,
+                "weight_decay":    t_cfg["weight_decay"],
+                "batch_size":      t_cfg["batch_size"],
+                "dice_weight":     t_cfg["dice_weight"],
+                "bce_weight":      t_cfg["bce_weight"],
+                "image_size":      size,
+                "tta_val":         use_tta_val,
+                "train_cities":    str(train_cities),
+                "val_cities":      str(val_cities),
+                "device":          device,
+            })
 
-        for epoch in range(1, total_epochs + 1):
+        current_run_id = run.info.run_id
+
+        for epoch in range(start_epoch, total_epochs + 1):
 
             # ── phase transition ──────────────────────────────────────────
             if epoch == warmup_epochs + 1:
@@ -316,16 +405,9 @@ def main():
                     f"encoder unfrozen  encoder_lr={encoder_lr}  decoder_lr={decoder_lr}"
                 )
                 model.unfreeze_encoder()
-                # Rebuild optimizer — now all three param groups are active
-                optimizer = model.make_optimizer(
-                    encoder_lr=encoder_lr,
-                    decoder_lr=decoder_lr,
-                    weight_decay=t_cfg["weight_decay"],
+                optimizer, scheduler = build_phase2_optimizer_and_scheduler(
+                    model, t_cfg, phase2_epochs
                 )
-                if t_cfg["scheduler"] == "cosine":
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer, T_max=phase2_epochs, eta_min=1e-6
-                    )
 
             # ── train & validate ──────────────────────────────────────────
             t0 = time.time()
@@ -340,9 +422,9 @@ def main():
                 scheduler.step()
 
             # ── logging ───────────────────────────────────────────────────
-            lrs      = get_lrs(optimizer)
-            elapsed  = time.time() - t0
-            phase    = 1 if epoch <= warmup_epochs else 2
+            lrs     = get_lrs(optimizer)
+            elapsed = time.time() - t0
+            phase   = 1 if epoch <= warmup_epochs else 2
 
             print(
                 f"Epoch {epoch:03d}/{total_epochs}  [phase {phase}]  [{elapsed:.0f}s]  "
@@ -361,38 +443,53 @@ def main():
                 "val_recall":    val_m["recall"],
                 "phase":         float(phase),
             }
-            # Log each param group lr separately so MLflow shows the split
             for name, lr in lrs.items():
                 metrics_to_log[f"lr_{name}"] = lr
 
             mlflow.log_metrics(metrics_to_log, step=epoch)
 
             # ── checkpoint ───────────────────────────────────────────────
-            if val_m["iou"] > best_iou:
-                best_iou = val_m["iou"]
+            is_best = val_m["iou"] > best_iou
+            if is_best:
+                best_iou         = val_m["iou"]
                 patience_counter = 0
-                ckpt_path = checkpoint_dir / t_cfg["best_model_name"]
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_iou": best_iou,
-                    "model_config": {
-                        "encoder": cfg["model"]["encoder"],
-                        "in_channels": cfg["model"]["in_channels"],
-                    },
-                }, ckpt_path)
-                mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints")
-                print(f"New best IoU={best_iou:.4f} — checkpoint saved.")
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"Early stopping (no improvement for {patience} epochs).")
-                    break
+
+            # Shared state saved into both files
+            state = {
+                "epoch":                epoch,
+                "model_state_dict":     model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                "best_iou":             best_iou,
+                "patience_counter":     patience_counter,
+                "mlflow_run_id":        current_run_id,
+                "model_config": {
+                    "encoder":     cfg["model"]["encoder"],
+                    "in_channels": cfg["model"]["in_channels"],
+                },
+            }
+
+            # last_checkpoint.pth — overwritten every epoch, used for --resume
+            last_ckpt_path = checkpoint_dir / "last_checkpoint.pth"
+            torch.save(state, last_ckpt_path)
+
+            # best_model.pth — only overwritten on IoU improvement, used for inference
+            if is_best:
+                best_ckpt_path = checkpoint_dir / t_cfg["best_model_name"]
+                torch.save(state, best_ckpt_path)
+                mlflow.log_artifact(str(best_ckpt_path), artifact_path="checkpoints")
+                print(f"New best IoU={best_iou:.4f} — {t_cfg["best_model_name"]} updated.")
+
+            if patience_counter >= t_cfg["early_stopping_patience"]:
+                print(f"Early stopping (no improvement for {patience_counter} epochs).")
+                break
 
         mlflow.log_metrics({"best_val_iou": best_iou})
         print(f"\nTraining complete.  Best val IoU: {best_iou:.4f}")
-        print(f"Checkpoint : {checkpoint_dir / t_cfg['best_model_name']}")
+        print(f"Resume ckpt: {checkpoint_dir}/last_checkpoint.pth")
+        print(f"Best model : {checkpoint_dir / t_cfg['best_model_name']}")
         print(f"MLflow UI  : mlflow ui --backend-store-uri sqlite:///mlruns.db --port 5000")
 
 
