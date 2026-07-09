@@ -25,6 +25,11 @@ Optionally enabled during validation (tta_val: true in config).
 Always recommended for the final evaluate.py run (tta_eval: true).
 8 geometric variants (4 rotations × 2 flips) are averaged.
 
+Checkpoint strategy
+--------------------
+  last_checkpoint.pth — overwritten every epoch, used for --resume
+  best_model.pth      — overwritten only on IoU improvement, used for inference
+
 Resuming after interruption
 ----------------------------
   python train.py --resume checkpoints/last_checkpoint.pth
@@ -33,11 +38,16 @@ Resuming after interruption
   patience counter, and the MLflow run ID so metrics continue on the
   same run rather than starting a new one.
 
+  Key fix: optimizer state is loaded BEFORE the scheduler is created
+  with last_epoch > 0. PyTorch requires initial_lr to already be present
+  in the optimizer param groups before CosineAnnealingLR can resume
+  mid-cycle — loading the optimizer state dict first satisfies this.
+
 Usage
 -----
-python train.py                                             # fresh run
-python train.py --config my_config.yaml                     # custom config
-python train.py --resume checkpoints/last_checkpoint.pth    # resume
+python train.py                                                    # fresh run
+python train.py --config my_config.yaml                           # custom config
+python train.py --resume checkpoints/last_checkpoint.pth          # resume
 """
 
 import argparse
@@ -86,7 +96,7 @@ def compute_metrics(
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> dict:
-    preds   = (torch.sigmoid(logits) > threshold).float().squeeze(1) # (B, H, W)
+    preds   = (torch.sigmoid(logits) > threshold).float().squeeze(1)
     targets = targets.float()
 
     tp = (preds * targets).sum(dim=(1, 2))
@@ -160,7 +170,7 @@ def validate(model, loader, criterion, device, use_tta: bool = False):
 
         if use_tta:
             # TTA: binary predictions averaged over 8 augmentations
-            preds   = model.predict_tta(images).float().squeeze(1) # (B, H, W)
+            preds   = model.predict_tta(images).float().squeeze(1)
             targets = masks.float()
             tp = (preds * targets).sum(dim=(1, 2))
             fp = (preds * (1 - targets)).sum(dim=(1, 2))
@@ -185,30 +195,10 @@ def validate(model, loader, criterion, device, use_tta: bool = False):
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def get_lrs(optimizer) -> dict:
-    """Return current lr for each named param group."""
     return {
         pg.get("name", f"group_{i}"): pg["lr"]
         for i, pg in enumerate(optimizer.param_groups)
     }
-
-
-def build_phase2_optimizer_and_scheduler(model, t_cfg, phase2_epochs, last_epoch=-1):
-    """
-    Build the phase 2 optimizer + cosine scheduler.
-    last_epoch lets the scheduler resume mid-cosine-cycle correctly.
-    """
-    optimizer = model.make_optimizer(
-        encoder_lr=t_cfg["encoder_lr"],
-        decoder_lr=t_cfg["decoder_lr"],
-        weight_decay=t_cfg["weight_decay"],
-    )
-    scheduler = None
-    if t_cfg["scheduler"] == "cosine" and phase2_epochs > 0:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=phase2_epochs, eta_min=1e-6,
-            last_epoch=last_epoch,
-        )
-    return optimizer, scheduler
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -220,7 +210,7 @@ def main():
         "--resume",
         default=None,
         metavar="CHECKPOINT",
-        help="Path to a checkpoint to resume from (e.g. checkpoints/last_checkpoint.pth)",
+        help="Path to last_checkpoint.pth to resume from",
     )
     args = parser.parse_args()
 
@@ -230,7 +220,7 @@ def main():
     # ── device ───────────────────────────────────────────────────────────
     device  = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = device == "cuda"
-    scaler  = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler  = torch.cuda.amp.GradScaler() if use_amp else None
     print(f"Device: {device}  |  AMP: {use_amp}")
 
     # ── data ─────────────────────────────────────────────────────────────
@@ -256,21 +246,21 @@ def main():
     print(f"Train patches: {len(train_ds)}  |  Val patches: {len(val_ds)}")
 
     train_loader = DataLoader(
-        dataset=train_ds, 
+        train_ds, 
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,  
         num_workers=cfg["training"]["num_workers"],
         pin_memory=(device == "cuda"),
     )
     val_loader = DataLoader(
-        dataset=val_ds, 
+        val_ds, 
         batch_size=cfg["training"]["batch_size"],
         shuffle=False, 
         num_workers=cfg["training"]["num_workers"],
         pin_memory=(device == "cuda"),
     )
 
-    # ── fine-tuning config ────────────────────────────────────────────────
+    # ── config shortcuts ──────────────────────────────────────────────────
     t_cfg         = cfg["training"]
     warmup_epochs = t_cfg["warmup_epochs"]
     total_epochs  = t_cfg["epochs"]
@@ -291,7 +281,7 @@ def main():
     start_epoch      = 1
     best_iou         = 0.0
     patience_counter = 0
-    resume_run_id    = None   # MLflow run to continue logging into
+    resume_run_id    = None     # MLflow run to continue logging into
     scheduler        = None
 
     if args.resume:
@@ -302,7 +292,7 @@ def main():
         print(f"\nResuming from checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device)
 
-        # ── restore model ────────────────────────────────────────────────
+        # ── 1. Restore model weights
         model_cfg = checkpoint.get("model_config", {})
         model = UNetBuilding(
             encoder_name=model_cfg.get("encoder", cfg["model"]["encoder"]),
@@ -311,21 +301,20 @@ def main():
         ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
 
-        # ── restore training state ───────────────────────────────────────
+        # ── 2. Restore training state
         start_epoch      = checkpoint["epoch"] + 1
         best_iou         = checkpoint.get("best_iou", 0.0)
         patience_counter = checkpoint.get("patience_counter", 0)
         resume_run_id    = checkpoint.get("mlflow_run_id", None)
 
-        # ── restore optimizer + scheduler ────────────────────────────────
         resumed_in_phase2 = start_epoch > warmup_epochs
 
         if resumed_in_phase2:
             model.unfreeze_encoder()
-            # How many phase2 steps have already run — tells cosine where it is
-            steps_done = start_epoch - warmup_epochs - 1
-            optimizer, scheduler = build_phase2_optimizer_and_scheduler(
-                model, t_cfg, phase2_epochs, last_epoch=steps_done
+            optimizer = model.make_optimizer(
+                encoder_lr=encoder_lr,
+                decoder_lr=decoder_lr,
+                weight_decay=t_cfg["weight_decay"],
             )
         else:
             model.freeze_encoder()
@@ -335,10 +324,23 @@ def main():
                 weight_decay=t_cfg["weight_decay"],
             )
 
+        # ── 3. Load optimizer state BEFORE creating the scheduler.
+        #       CosineAnnealingLR with last_epoch > 0 requires initial_lr to
+        #       already exist in the optimizer param groups, which only happens
+        #       after load_state_dict() has run.
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-        if scheduler is not None and "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        # ── 4. Now it is safe to create the scheduler with last_epoch
+        if resumed_in_phase2 and t_cfg["scheduler"] == "cosine":
+            steps_done = start_epoch - warmup_epochs - 1
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=phase2_epochs,
+                eta_min=1e-6,
+                last_epoch=steps_done,
+            )
+            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"]:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         print(f"  Resuming from epoch {start_epoch}/{total_epochs}")
         print(f"  Best IoU so far : {best_iou:.4f}")
@@ -353,7 +355,7 @@ def main():
             in_channels=cfg["model"]["in_channels"],
         ).to(device)
 
-        # ── phase 1 setup: freeze encoder, decoder-only optimizer ────────────
+        # ── phase 1 setup: freeze encoder, decoder-only optimizer 
         print(f"\nPhase 1 — warmup ({warmup_epochs} epochs): encoder frozen, decoder lr={decoder_lr}")
         model.freeze_encoder()
 
@@ -405,9 +407,15 @@ def main():
                     f"encoder unfrozen  encoder_lr={encoder_lr}  decoder_lr={decoder_lr}"
                 )
                 model.unfreeze_encoder()
-                optimizer, scheduler = build_phase2_optimizer_and_scheduler(
-                    model, t_cfg, phase2_epochs
+                optimizer = model.make_optimizer(
+                    encoder_lr=encoder_lr,
+                    decoder_lr=decoder_lr,
+                    weight_decay=t_cfg["weight_decay"],
                 )
+                if t_cfg["scheduler"] == "cosine":
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer, T_max=phase2_epochs, eta_min=1e-6
+                    )
 
             # ── train & validate ──────────────────────────────────────────
             t0 = time.time()
@@ -472,15 +480,14 @@ def main():
             }
 
             # last_checkpoint.pth — overwritten every epoch, used for --resume
-            last_ckpt_path = checkpoint_dir / "last_checkpoint.pth"
-            torch.save(state, last_ckpt_path)
+            torch.save(state, checkpoint_dir / "last_checkpoint.pth")
 
             # best_model.pth — only overwritten on IoU improvement, used for inference
             if is_best:
                 best_ckpt_path = checkpoint_dir / t_cfg["best_model_name"]
                 torch.save(state, best_ckpt_path)
                 mlflow.log_artifact(str(best_ckpt_path), artifact_path="checkpoints")
-                print(f"New best IoU={best_iou:.4f} — {t_cfg["best_model_name"]} updated.")
+                print(f"New best IoU={best_iou:.4f} — best_model.pth updated.")
 
             if patience_counter >= t_cfg["early_stopping_patience"]:
                 print(f"Early stopping (no improvement for {patience_counter} epochs).")
