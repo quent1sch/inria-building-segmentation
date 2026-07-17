@@ -130,7 +130,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast():
                 logits = model(images)
                 loss   = criterion(logits, masks)
             scaler.scale(loss).backward()
@@ -220,7 +220,7 @@ def main():
     # ── device ───────────────────────────────────────────────────────────
     device  = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = device == "cuda"
-    scaler  = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler  = torch.amp.GradScaler() if use_amp else None
     print(f"Device: {device}  |  AMP: {use_amp}")
 
     # ── data ─────────────────────────────────────────────────────────────
