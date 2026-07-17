@@ -58,13 +58,13 @@ class SegmentationInference:
     # ── normalisation ─────────────────────────────────────────────────────
 
     def _normalize(self, image: np.ndarray) -> np.ndarray:
-        """HWC uint8 → HWC float32 normalised with ImageNet stats."""
+        """HWC uint8 -> HWC float32 normalised with ImageNet stats."""
         img = image.astype(np.float32) / 255.0
         img = (img - self.mean) / self.std
         return img
 
     def _to_tensor(self, image: np.ndarray) -> torch.Tensor:
-        """HWC float32 → 1CHW torch.Tensor."""
+        """HWC float32 -> 1CHW torch.Tensor."""
         img = self._normalize(image)
         tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
         return tensor.to(self.device)
@@ -92,8 +92,8 @@ class SegmentationInference:
         size = self.tile_size
         step = size - self.overlap
 
-        prob_acc = np.zeros((H, W), dtype=np.float32)
-        count_acc = np.zeros((H, W), dtype=np.float32)
+        # prob_acc = np.zeros((H, W), dtype=np.float32)
+        # count_acc = np.zeros((H, W), dtype=np.float32)
 
         # Pad image so every position is covered
         pad_h = max(0, size - H % step if H % step != 0 else 0)
@@ -106,6 +106,8 @@ class SegmentationInference:
             )
 
         pH, pW = image.shape[:2]
+        prob_acc = np.zeros((pH, pW), dtype=np.float32)
+        count_acc = np.zeros((pH, pW), dtype=np.float32)
 
         ys = list(range(0, pH - size + 1, step))
         xs = list(range(0, pW - size + 1, step))

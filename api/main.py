@@ -64,7 +64,7 @@ def get_inference() -> SegmentationInference:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 async def read_image_upload(file: UploadFile) -> np.ndarray:
-    """Read uploaded file → HWC uint8 numpy (RGB)."""
+    """Read uploaded file -> HWC uint8 numpy (RGB)."""
     data = await file.read()
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -74,7 +74,7 @@ async def read_image_upload(file: UploadFile) -> np.ndarray:
 
 
 def mask_to_png_bytes(mask: np.ndarray) -> bytes:
-    """Binary mask (H, W bool/uint8) → PNG bytes."""
+    """Binary mask (H, W bool/uint8) _> PNG bytes."""
     img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
