@@ -54,3 +54,4 @@ inference:
   overlap: 128                    # sliding-window overlap in pixels
   threshold: 0.5                  # sigmoid threshold for binary mask
   tta: true                       # use TTA for API inference
+  target_resolution: 0.3          # metres/pixel — Inria training resolution
