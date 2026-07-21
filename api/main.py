@@ -5,10 +5,21 @@ FastAPI application exposing the building segmentation model as a REST API.
 
 Endpoints
 ---------
-GET  /health          — liveness check
-POST /predict         — binary mask PNG
-POST /predict/overlay — original image with red building overlay PNG
+POST /predict              — building mask PNG
+POST /predict/overlay      — original image with buildings highlighted PNG
 POST /predict/vector       — GeoJSON FeatureCollection of building polygons
+
+Output processing levels
+-------------------------
+  raw         Direct model output, thresholded.
+  clean       Vectorized (polygonized + simplified + filtered) then
+              rasterized back to a pixel mask.
+  vectorized  Vectorized polygon outlines — only meaningful for overlay.
+ 
+Applies to:
+  /predict        → ?processing=raw (default) | clean
+  /predict/overlay → ?processing=raw (default) | vectorized | clean
+  /predict/vector  → always vectorized (no param)
 
 Resolution parameters (both endpoints)
 ---------------------------------------
@@ -16,14 +27,9 @@ Resolution parameters (both endpoints)
                      If omitted and the file is a GeoTIFF with embedded CRS,
                      resolution is read automatically.
  
-  ?resample=false    Disable resampling even if image is finer than 0.3m/px.
+  ?resample=false    Disable resampling for finer-than-training images.
                      Default: true (resample when beneficial).
  
-Resolution logic
-----------------
-  Finer than 0.3m/px   -> resampled to 0.3m/px (unless resample=false)
-  Coarser than 0.3m/px -> not resampled; warning returned in headers
-  Unknown              -> no action
 
 Vectorization parameters (/predict/vector and /predict/overlay?vectorized=true)
 ---------------------------------------------------------------------------------
@@ -37,6 +43,7 @@ Response headers (when resolution is known)
   X-Resampling-Applied : "true" / "false"
   X-Resampled-To       : target resolution used (only when resampling applied)
   X-Resolution-Warning : human-readable warning (only when applicable)
+  X-Building-Count      number of polygons (/predict/vector only)
 
 Usage
 -----
@@ -45,18 +52,32 @@ uvicorn api.main:app --reload --port 8000
 Examples
 --------
   # Raw mask
-  curl -X POST http://localhost:8000/predict -F "file=@tile.tif" --output mask.png
+  curl -X POST http://localhost:8000/predict \\
+       -F "file=@tile.tif" --output mask.png
  
-  # Vectorized GeoJSON (requires resolution for area filter)
+  # Clean mask (vectorized → rasterized)
+  curl -X POST "http://localhost:8000/predict?processing=clean&resolution=0.3" \\
+       -F "file=@tile.tif" --output clean_mask.png
+ 
+  # Raw overlay
+  curl -X POST http://localhost:8000/predict/overlay \\
+       -F "file=@tile.tif" --output overlay.png
+ 
+  # Overlay with clean polygon outlines
+  curl -X POST "http://localhost:8000/predict/overlay?processing=vectorized&resolution=0.3" \\
+       -F "file=@tile.tif" --output overlay_vector.png
+ 
+  # Overlay with clean rasterized fill
+  curl -X POST "http://localhost:8000/predict/overlay?processing=clean&resolution=0.3" \\
+       -F "file=@tile.tif" --output overlay_clean.png
+ 
+  # GeoJSON polygons
   curl -X POST "http://localhost:8000/predict/vector?resolution=0.3" \\
        -F "file=@tile.tif"
- 
-  # Overlay with clean polygon boundaries
-  curl -X POST "http://localhost:8000/predict/overlay?vectorized=true&resolution=0.3" \\
-       -F "file=@tile.tif" --output overlay.png
 """
 
 import io
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +89,20 @@ from PIL import Image, ImageDraw
 from api.inference import ResolutionInfo, SegmentationInference, read_image_bytes
 from api.vectorize import geojson_to_bytes, polygons_to_mask, vectorize
 
+
+# ── enums ─────────────────────────────────────────────────────────────────────
+ 
+class MaskProcessing(str, Enum):
+    raw   = "raw"
+    clean = "clean"
+ 
+ 
+class OverlayProcessing(str, Enum):
+    raw        = "raw"
+    vectorized = "vectorized"
+    clean      = "clean"
+
+
 # ── app setup ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -78,7 +113,7 @@ app = FastAPI(
         "The model was trained on the Inria Aerial Image Labeling dataset at **0.3m/pixel**. "
         "Supply `?resolution=` or use a georeferenced GeoTIFF for automatic resolution handling."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # ── model singleton ──────────────────────────────────────────────────────────
@@ -145,7 +180,7 @@ def mask_to_png_bytes(mask: np.ndarray) -> bytes:
     return buf.getvalue()
     
 
-def raw_overlay_png(image: np.ndarray, mask: np.ndarray) -> bytes:
+def _raw_overlay(image: np.ndarray, mask: np.ndarray) -> bytes:
     """Original image with raw mask pixels highlighted in red."""
     overlay = image.copy()
     overlay[mask > 0] = np.clip(
@@ -157,7 +192,7 @@ def raw_overlay_png(image: np.ndarray, mask: np.ndarray) -> bytes:
     return buf.getvalue()
  
  
-def vector_overlay_png(image: np.ndarray, geojson: dict) -> bytes:
+def _vector_overlay(image: np.ndarray, geojson: dict) -> bytes:
     """
     Original image with simplified building polygon outlines drawn in red.
     Uses PIL ImageDraw so polygon edges are clean vectors, not raster fills.
@@ -190,10 +225,17 @@ def _draw_polygon_pil(draw: ImageDraw.Draw, coords: list) -> None:
     exterior = [tuple(pt) for pt in coords[0]]
     if len(exterior) >= 3:
         draw.polygon(exterior, fill=(255, 50, 50, 120), outline=(255, 50, 50, 220))
+
     for hole in coords[1:]:
         pts = [tuple(pt) for pt in hole]
         if len(pts) >= 3:
             draw.polygon(pts, fill=(0, 0, 0, 0))
+
+
+def _clean_overlay(image: np.ndarray, geojson: dict, H: int, W: int) -> bytes:
+    """Rasterized clean mask pixels filled red on original image."""
+    clean_mask = polygons_to_mask(geojson, height=H, width=W)
+    return _raw_overlay(image, clean_mask)
 
 
 # ── shared query param docs ───────────────────────────────────────────────────
@@ -217,33 +259,47 @@ _MIN_AREA_DOC = (
 )
  
 
-# ── routes ───────────────────────────────────────────────────────────────────
-
-@app.get("/health", summary="Health check")
-def health():
-    return {"status": "ok", "model_loaded": _inference is not None}
- 
+# ── /predict ──────────────────────────────────────────────────────────────────
  
 @app.post(
     "/predict",
-    summary="Predict binary building mask",
+    summary="Building mask PNG",
     response_class=Response,
     responses={200: {"content": {"image/png": {}}}},
 )
 async def predict(
     file: UploadFile = File(..., description="Aerial image (JPEG, PNG, GeoTIFF)"),
+    processing: MaskProcessing = Query(
+        MaskProcessing.raw,
+        description=(
+            "**raw** — direct model output. "
+            "**clean** — vectorized (polygonized + simplified + filtered) "
+            "then rasterized back to pixels."
+        ),
+    ),
     resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
     resample: bool = Query(True, description=_RESAMPLE_DOC),
+    simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
+    min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
 ):
     """
     Returns a **binary mask PNG** (white = building, black = background).
-    Output is always aligned to the original input pixel grid.
+ 
+    - `processing=raw` (default): direct model output
+    - `processing=clean`: polygonized → simplified → rasterized back to pixels
     """
     image, auto_res = await load_upload(file)
     eff_res = resolution if resolution is not None else auto_res
  
     model = get_inference()
     mask, info = model.predict(image, input_resolution=eff_res, resample=resample)
+ 
+    if processing == MaskProcessing.clean:
+        geojson    = vectorize(mask, resolution=eff_res,
+                               simplify_tolerance_m=simplify_tolerance,
+                               min_area_m2=min_area)
+        H, W       = image.shape[:2]
+        mask       = polygons_to_mask(geojson, height=H, width=W)
  
     return Response(
         content=mask_to_png_bytes(mask),
@@ -252,31 +308,35 @@ async def predict(
     )
  
  
+# ── /predict/overlay ──────────────────────────────────────────────────────────
+ 
 @app.post(
     "/predict/overlay",
-    summary="Predict with coloured overlay",
+    summary="Building overlay PNG",
     response_class=Response,
     responses={200: {"content": {"image/png": {}}}},
 )
 async def predict_overlay(
     file: UploadFile = File(..., description="Aerial image (JPEG, PNG, GeoTIFF)"),
-    resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
-    resample: bool = Query(True, description=_RESAMPLE_DOC),
-    vectorized: bool = Query(
-        False,
+    processing: OverlayProcessing = Query(
+        OverlayProcessing.raw,
         description=(
-            "If true, draw clean simplified polygon outlines instead of the raw "
-            "pixel mask. Requires `resolution` for area filtering."
+            "**raw** — raw mask pixels filled red. "
+            "**vectorized** — clean simplified polygon outlines. "
+            "**clean** — vectorized then rasterized, filled red."
         ),
     ),
+    resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
+    resample: bool = Query(True, description=_RESAMPLE_DOC),
     simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
     min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
 ):
     """
     Returns the original image with buildings highlighted.
  
-    - `vectorized=false` (default): raw mask pixels filled red
-    - `vectorized=true`: clean simplified polygon outlines
+    - `processing=raw` (default): raw mask pixels filled red
+    - `processing=vectorized`: clean simplified polygon outlines drawn
+    - `processing=clean`: vectorized → rasterized → filled red
     """
     image, auto_res = await load_upload(file)
     eff_res = resolution if resolution is not None else auto_res
@@ -284,16 +344,22 @@ async def predict_overlay(
     model = get_inference()
     mask, info = model.predict(image, input_resolution=eff_res, resample=resample)
  
-    if vectorized:
-        geojson = vectorize(
-            mask,
-            resolution=eff_res,
-            simplify_tolerance_m=simplify_tolerance,
-            min_area_m2=min_area,
-        )
-        png_bytes = vector_overlay_png(image, geojson)
-    else:
-        png_bytes = raw_overlay_png(image, mask)
+    H, W = image.shape[:2]
+ 
+    if processing == OverlayProcessing.raw:
+        png_bytes = _raw_overlay(image, mask)
+ 
+    elif processing == OverlayProcessing.vectorized:
+        geojson   = vectorize(mask, resolution=eff_res,
+                              simplify_tolerance_m=simplify_tolerance,
+                              min_area_m2=min_area)
+        png_bytes = _vector_overlay(image, geojson)
+ 
+    else:  # clean
+        geojson   = vectorize(mask, resolution=eff_res,
+                              simplify_tolerance_m=simplify_tolerance,
+                              min_area_m2=min_area)
+        png_bytes = _clean_overlay(image, geojson, H, W)
  
     return Response(
         content=png_bytes,
@@ -302,9 +368,11 @@ async def predict_overlay(
     )
  
  
+# ── /predict/vector ───────────────────────────────────────────────────────────
+ 
 @app.post(
     "/predict/vector",
-    summary="Predict and vectorize to GeoJSON",
+    summary="Building polygons GeoJSON",
     response_class=JSONResponse,
 )
 async def predict_vector(
@@ -313,29 +381,18 @@ async def predict_vector(
     resample: bool = Query(True, description=_RESAMPLE_DOC),
     simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
     min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
-    return_mask: bool = Query(
-        False,
-        description=(
-            "If true, also return a 'clean_mask_png' base64 field containing "
-            "the vectorized polygons rasterized back to a PNG mask. "
-            "Useful for comparing raw vs. vectorized predictions."
-        ),
-    ),
 ):
     """
     Returns a **GeoJSON FeatureCollection** of building polygons.
  
     Coordinates are in **pixel space** (col, row) of the original input image.
  
-    Pipeline: raw mask -> polygonization -> Douglas-Peucker simplification
-              -> area filtering -> GeoJSON
- 
     Each feature has properties:
-    - `area_px`: polygon area in pixels
-    - `area_m2`: real-world area in m2 (only when resolution is known)
+    - `area_px`: polygon area in pixels²
+    - `area_m2`: real-world area in m² (only when resolution is known)
  
-    Set `return_mask=true` to also receive the vectorized mask PNG
-    (polygons rasterized back to pixels) for quality comparison.
+    The response `metadata` block records the parameters used
+    (n_buildings, resolution, simplify_tolerance, min_area).
     """
     image, auto_res = await load_upload(file)
     eff_res = resolution if resolution is not None else auto_res
@@ -350,21 +407,17 @@ async def predict_vector(
         min_area_m2=min_area,
     )
  
-    if return_mask:
-        import base64
-        H, W = image.shape[:2]
-        clean_mask = polygons_to_mask(geojson, height=H, width=W)
-        png_bytes = mask_to_png_bytes(clean_mask)
-        geojson["clean_mask_png_base64"] = base64.b64encode(png_bytes).decode()
- 
     headers = resolution_headers(info)
     headers["X-Building-Count"] = str(geojson["metadata"]["n_buildings"])
  
-    return JSONResponse(
-        content=geojson,
-        headers=headers,
-    )
+    return JSONResponse(content=geojson, headers=headers)
  
+ 
+# ── health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health", summary="Health check")
+def health():
+    return {"status": "ok", "model_loaded": _inference is not None}
  
 @app.get("/", include_in_schema=False)
 def root():
