@@ -456,13 +456,13 @@ class SegmentationInference:
             proc_image, info = result
             orig_h, orig_w = original_h, original_w
  
-        mask = self._predict_array(proc_image) # float32 probability map
+        prob = self._predict_array(proc_image) # float32 probability map
  
         # Upsample probability map BEFORE thresholding (if resampling).
         # This preserves smooth boundary gradients so the final threshold
         # produces clean sharp edges rather than blocky/rounded contours.
         if info.resampled:
-            prob = upsample_prob(mask, orig_h, orig_w)
+            prob = upsample_prob(prob, orig_h, orig_w)
 
         mask = prob > self.threshold   # threshold last, at full resolution
  
