@@ -464,7 +464,7 @@ class SegmentationInference:
         if info.resampled:
             prob = upsample_prob(prob, orig_h, orig_w)
 
-        mask = prob > self.threshold   # threshold last, at full resolution
+        mask = prob > self.threshold # threshold last, at full resolution
  
         return mask, info
  
