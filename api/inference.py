@@ -203,21 +203,23 @@ def resample_image(
     return resampled
  
  
-def upsample_mask(
-    mask: np.ndarray,
+def upsample_prob(
+    prob: np.ndarray,
     original_h: int,
     original_w: int,
 ) -> np.ndarray:
     """
-    Resize a bool mask back to (original_h, original_w).
-    Uses nearest-neighbour interpolation to preserve binary values.
+    Upsample a float32 probability map back to (original_h, original_w).
+    Uses bilinear interpolation to preserve smooth probability gradients
+    near boundaries — thresholding after this produces sharper edges than
+    nearest-neighbour upsampling of a binary mask.
     """
-    resized = cv2.resize(
-        mask.astype(np.uint8),
+    return cv2.resize(
+        prob,
         (original_w, original_h),
-        interpolation=cv2.INTER_NEAREST,
+        interpolation=cv2.INTER_LINEAR,
     )
-    return resized.astype(bool)
+    
  
  
 # ── main inference class ──────────────────────────────────────────────────────
@@ -341,7 +343,10 @@ class SegmentationInference:
     def _predict_array(self, image: np.ndarray) -> np.ndarray:
         """
         Run sliding-window inference on a preprocessed HWC uint8 RGB array.
-        Returns a bool mask (H, W) at the same resolution as the input.
+        Returns a float32 probability map (H, W) in [0, 1].
+        Thresholding is intentionally deferred to predict() so it happens
+        AFTER any upsampling - applying threshold before upsampling would
+        produce jagged/rounded edges on building contours.
         """
         H, W = image.shape[:2]
  
@@ -365,7 +370,7 @@ class SegmentationInference:
             # Combine: if either standard or TTA prob agrees, trust the average
             prob = (prob + tta_prob) / 2.0
  
-        return prob > self.threshold
+        return prob # float32, NOT thresholded
  
     # ── resolution-aware preprocessing ───────────────────────────────────
  
@@ -451,11 +456,15 @@ class SegmentationInference:
             proc_image, info = result
             orig_h, orig_w = original_h, original_w
  
-        mask = self._predict_array(proc_image)
+        mask = self._predict_array(proc_image) # float32 probability map
  
-        # Upsample mask back to original dimensions if we resampled
+        # Upsample probability map BEFORE thresholding (if resampling).
+        # This preserves smooth boundary gradients so the final threshold
+        # produces clean sharp edges rather than blocky/rounded contours.
         if info.resampled:
-            mask = upsample_mask(mask, orig_h, orig_w)
+            prob = upsample_prob(mask, orig_h, orig_w)
+
+        mask = prob > self.threshold   # threshold last, at full resolution
  
         return mask, info
  
