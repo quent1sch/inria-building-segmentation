@@ -1,9 +1,11 @@
 # Data (large files — don't commit)
 data/raw/
 data/patches/
+data/
 
 # Model checkpoints
 checkpoints/*.pth
+checkpoints/
 
 # MLflow runs
 mlruns/

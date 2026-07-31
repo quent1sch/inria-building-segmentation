@@ -1,32 +1,41 @@
 """
 evaluation/metrics_building.py
-
+ 
 Object-level (building-level) evaluation.
-
+ 
 Pixel metrics miss a key user concern: whether individual buildings are
 detected at all. A model that correctly segments 95% of pixels in a large
 building but completely misses 10 small buildings looks good at pixel level
 but fails in practice.
-
+ 
 Approach
 --------
   1. Vectorize both prediction and GT masks into polygons
   2. Match predicted polygons to GT polygons by IoU overlap (COCO-style)
   3. A predicted building is a TP if it overlaps a GT building by IoU >= iou_threshold
   4. Compute detection Precision, Recall, F1 and mean matched IoU
-
-Matching uses a greedy algorithm (sort by IoU, match highest first) which
-is standard for building detection. For large sets, a Shapely STRtree is
-used for spatial indexing to avoid O(n x m) brute-force comparison.
-
+ 
+Both conditions are evaluated and compared:
+  raw_vectorized  — polygonize raw mask, area filter only (no simplification)
+                    reflects pure model detection quality
+  clean  — full pipeline (simplify + area filter)
+           reveals whether simplification merges/splits buildings
+ 
+The comparison between raw_vectorized and clean is informative:
+  - Detection recall/precision can genuinely differ if simplification merges
+    adjacent blobs or if simplified polygons shrink below the area threshold
+  - Mean matched IoU measures boundary quality improvement from simplification
+ 
+Matching uses a greedy algorithm (sort by IoU, match highest first).
+For large sets, a Shapely STRtree is used for spatial indexing.
+ 
 Size-stratified metrics
 ------------------------
 Buildings are stratified by real-world area into three bins:
-  small  : < 50 m²   (sheds, garages)
-  medium : 50-500 m²  (typical residential buildings)
-  large  : > 500 m²   (commercial / industrial)
-
-These require resolution to be known. If unknown, stratification is skipped.
+  small  : < 50 m2 (sheds, garages)
+  medium : 50-500 m2 (typical residential)
+  large  : > 500 m2 (commercial / industrial)
+Requires resolution to be known.
 """
 
 from __future__ import annotations
@@ -120,7 +129,48 @@ def get_size_label(area_m2: float) -> str:
     return "large"
 
 
-# ── per-sample building metrics ───────────────────────────────────────────────
+# ── core per-sample metrics ───────────────────────────────────────────────────
+ 
+def _compute_detection_metrics(
+    pred_polys: list,
+    gt_polys: list,
+    resolution: Optional[float],
+    iou_threshold: float,
+) -> dict:
+    """Compute detection metrics given two polygon lists."""
+    matches, unmatched_pred, unmatched_gt = match_polygons(
+        pred_polys, gt_polys, iou_threshold=iou_threshold
+    )
+ 
+    tp = len(matches)
+    fp = len(unmatched_pred)
+    fn = len(unmatched_gt)
+ 
+    smooth = 1e-6
+    precision = (tp + smooth) / (tp + fp + smooth)
+    recall = (tp + smooth) / (tp + fn + smooth)
+    f1 = 2 * precision * recall / (precision + recall + smooth)
+    mean_iou = float(np.mean([m[2] for m in matches])) if matches else 0.0
+    miss_rate = fn / (tp + fn + smooth)
+    false_alarm = fp / (tp + fp + smooth)
+ 
+    result = {
+        "n_pred": len(pred_polys),
+        "n_gt": len(gt_polys),
+        "tp": tp, "fp": fp, "fn": fn,
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "mean_iou_matched": float(mean_iou),
+        "miss_rate": float(miss_rate),
+        "false_alarm_rate": float(false_alarm),
+    }
+ 
+    if resolution is not None:
+        matched_gt_idxs = {g_idx for _, g_idx, _ in matches}
+        result["by_size"] = _size_stratified(gt_polys, matched_gt_idxs, resolution)
+ 
+    return result
 
 def building_metrics_sample(
     pred_mask: np.ndarray,
@@ -131,59 +181,44 @@ def building_metrics_sample(
     min_area_m2: float = 10.0,
 ) -> dict:
     """
-    Compute building-level metrics for a single image.
-
-    Vectorizes both masks, matches polygons, returns detection metrics.
+    Compute building-level metrics for both raw_vectorized and clean conditions.
+ 
+    raw_vectorized : polygonize + area filter only (no simplification)
+    clean          : polygonize + simplify + area filter
     """
     from api.vectorize import vectorize
-
-    pred_geojson = vectorize(pred_mask, resolution=resolution,
-                             simplify_tolerance_m=simplify_tolerance_m,
-                             min_area_m2=min_area_m2)
-    gt_geojson   = vectorize(gt_mask, resolution=resolution,
-                             simplify_tolerance_m=simplify_tolerance_m,
-                             min_area_m2=min_area_m2)
-
-    pred_polys = _geojson_to_polygons(pred_geojson)
-    gt_polys   = _geojson_to_polygons(gt_geojson)
-
-    matches, unmatched_pred, unmatched_gt = match_polygons(
-        pred_polys, gt_polys, iou_threshold=iou_threshold
+ 
+    # GT always uses full postprocessing for clean polygon boundaries
+    gt_geojson = vectorize(
+        gt_mask, resolution=resolution,
+        simplify_tolerance_m=simplify_tolerance_m,
+        min_area_m2=min_area_m2,
     )
-
-    tp = len(matches)
-    fp = len(unmatched_pred)
-    fn = len(unmatched_gt)
-
-    smooth = 1e-6
-    precision = (tp + smooth) / (tp + fp + smooth)
-    recall = (tp + smooth) / (tp + fn + smooth)
-    f1 = 2 * precision * recall / (precision + recall + smooth)
-    mean_iou = float(np.mean([m[2] for m in matches])) if matches else 0.0
-    miss_rate = fn / (tp + fn + smooth)
-    false_alarm = fp / (tp + fp + smooth)
-
-    result = {
-        "n_pred": len(pred_polys),
-        "n_gt": len(gt_polys),
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "mean_iou_matched": float(mean_iou),
-        "miss_rate": float(miss_rate),
-        "false_alarm_rate": float(false_alarm),
-    }
-
-    # Size-stratified metrics (requires resolution)
-    if resolution is not None:
-        result["by_size"] = _size_stratified(
-            pred_polys, gt_polys, matches, unmatched_pred, unmatched_gt, resolution
-        )
-
-    return result
+    gt_polys = _geojson_to_polygons(gt_geojson)
+ 
+    # ── raw vectorized: area filter only, no simplification ──────────────
+    pred_raw_geojson = vectorize(
+        pred_mask, resolution=resolution,
+        simplify_tolerance_m=0.0,
+        min_area_m2=min_area_m2,
+    )
+    pred_raw_polys = _geojson_to_polygons(pred_raw_geojson)
+    raw_metrics    = _compute_detection_metrics(
+        pred_raw_polys, gt_polys, resolution, iou_threshold
+    )
+ 
+    # ── clean: full postprocessing ────────────────────────────────────────
+    pred_clean_geojson = vectorize(
+        pred_mask, resolution=resolution,
+        simplify_tolerance_m=simplify_tolerance_m,
+        min_area_m2=min_area_m2,
+    )
+    pred_clean_polys = _geojson_to_polygons(pred_clean_geojson)
+    clean_metrics    = _compute_detection_metrics(
+        pred_clean_polys, gt_polys, resolution, iou_threshold
+    )
+ 
+    return {"raw": raw_metrics, "clean": clean_metrics}
 
 
 def _geojson_to_polygons(geojson: dict) -> list:
@@ -198,15 +233,9 @@ def _geojson_to_polygons(geojson: dict) -> list:
     return polys
 
 
-def _size_stratified(
-    pred_polys, gt_polys, matches, unmatched_pred, unmatched_gt, resolution
-) -> dict:
-    """Compute detection recall per building size stratum."""
-    matched_gt_idxs = {g_idx for _, g_idx, _ in matches}
+def _size_stratified(gt_polys, matched_gt_idxs: set, resolution: float) -> dict:
     results = {}
-
     for label, (lo, hi) in SIZE_BINS.items():
-        # GT buildings in this stratum
         gt_in_bin = [
             i for i, p in enumerate(gt_polys)
             if lo <= p.area * resolution ** 2 < hi
@@ -219,8 +248,45 @@ def _size_stratified(
             "n_detected": detected,
             "recall": detected / len(gt_in_bin),
         }
-
     return results
+
+
+# ── aggregation ───────────────────────────────────────────────────────────────
+ 
+SCALAR_KEYS = [
+    "precision", "recall", "f1",
+    "mean_iou_matched", "miss_rate", "false_alarm_rate",
+]
+ 
+ 
+def _aggregate_condition(samples_list: list, condition: str) -> dict:
+    """Aggregate scalar metrics for one condition (raw or clean)."""
+    cond_samples = [s[condition] for s in samples_list if condition in s]
+    if not cond_samples:
+        return {}
+    agg = {k: float(np.mean([s[k] for s in cond_samples])) for k in SCALAR_KEYS}
+    agg["n_samples"] = len(cond_samples)
+    agg["total_tp"]  = sum(s["tp"] for s in cond_samples)
+    agg["total_fp"]  = sum(s["fp"] for s in cond_samples)
+    agg["total_fn"]  = sum(s["fn"] for s in cond_samples)
+    if any("by_size" in s for s in cond_samples):
+        agg["by_size"] = _aggregate_size_strata(cond_samples)
+    return agg
+ 
+ 
+def _aggregate_size_strata(samples_list: list) -> dict:
+    strata: dict = defaultdict(lambda: {"n_gt": 0, "n_detected": 0})
+    for s in samples_list:
+        for label, data in s.get("by_size", {}).items():
+            strata[label]["n_gt"]       += data["n_gt"]
+            strata[label]["n_detected"] += data["n_detected"]
+    return {
+        label: {
+            **data,
+            "recall": data["n_detected"] / data["n_gt"] if data["n_gt"] > 0 else 0.0,
+        }
+        for label, data in strata.items()
+    }
 
 
 # ── evaluation runner ─────────────────────────────────────────────────────────
@@ -233,22 +299,20 @@ def run(
     simplify_tolerance_m: float = 0.5,
     min_area_m2: float = 10.0,
 ) -> dict:
-    """
-    Run building-level evaluation over all samples.
-    """
+    """Run building-level evaluation (both raw and clean) over all samples."""
     out_dir.mkdir(parents=True, exist_ok=True)
-
+ 
     city_results: dict[str, list] = defaultdict(list)
-
+ 
     for i, sample in enumerate(samples):
         print(f"  [{i+1}] {sample.name} ({sample.city})", end=" ", flush=True)
-
+ 
         mask, _ = model.predict(
             sample.image,
             input_resolution=sample.resolution,
             resample=True,
         )
-
+ 
         m = building_metrics_sample(
             mask, sample.gt_mask,
             resolution=sample.resolution,
@@ -257,92 +321,92 @@ def run(
             min_area_m2=min_area_m2,
         )
         city_results[sample.city].append(m)
-        print(f"Precision={m['precision']:.3f} Recall={m['recall']:.3f} F1={m['f1']:.3f}")
-
+        print(
+            f"raw  P={m['raw']['precision']:.3f} R={m['raw']['recall']:.3f} "
+            f"F1={m['raw']['f1']:.3f} | "
+            f"clean P={m['clean']['precision']:.3f} R={m['clean']['recall']:.3f} "
+            f"F1={m['clean']['f1']:.3f}"
+        )
+ 
     # ── aggregate ─────────────────────────────────────────────────────────
-    scalar_keys = ["precision", "recall", "f1", "mean_iou_matched",
-                   "miss_rate", "false_alarm_rate"]
-
-    results: dict = {"per_city": {}, "overall": {}, "iou_threshold": iou_threshold}
+    results: dict = {
+        "per_city": {},
+        "overall": {},
+        "iou_threshold": iou_threshold,
+    }
     all_samples = []
-
-    for city, samples_list in city_results.items():
-        agg = {k: float(np.mean([s[k] for s in samples_list])) for k in scalar_keys}
-        agg["n_samples"] = len(samples_list)
-        agg["total_pred"] = sum(s["n_pred"] for s in samples_list)
-        agg["total_gt"] = sum(s["n_gt"] for s in samples_list)
-        agg["total_tp"] = sum(s["tp"] for s in samples_list)
-        agg["total_fp"] = sum(s["fp"] for s in samples_list)
-        agg["total_fn"] = sum(s["fn"] for s in samples_list)
-
-        # Aggregate size-stratified if available
-        if any("by_size" in s for s in samples_list):
-            agg["by_size"] = _aggregate_size_strata(samples_list)
-
-        results["per_city"][city] = agg
+ 
+    for city, samples_list in sorted(city_results.items()):
+        results["per_city"][city] = {
+            "raw": _aggregate_condition(samples_list, "raw"),
+            "clean": _aggregate_condition(samples_list, "clean"),
+        }
         all_samples.extend(samples_list)
-
+ 
     if all_samples:
-        agg_all = {k: float(np.mean([s[k] for s in all_samples])) for k in scalar_keys}
-        agg_all["total_tp"] = sum(s["tp"] for s in all_samples)
-        agg_all["total_fp"] = sum(s["fp"] for s in all_samples)
-        agg_all["total_fn"] = sum(s["fn"] for s in all_samples)
-        if any("by_size" in s for s in all_samples):
-            agg_all["by_size"] = _aggregate_size_strata(all_samples)
-        results["overall"] = agg_all
-
-    # ── save and print ─────────────────────────────────────────────────────
+        results["overall"] = {
+            "raw": _aggregate_condition(all_samples, "raw"),
+            "clean": _aggregate_condition(all_samples, "clean"),
+        }
+ 
+    # ── save ──────────────────────────────────────────────────────────────
     json_path = out_dir / "metrics_building.json"
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
-
+ 
     _print_table(results)
     print(f"\n  Saved -> {json_path}")
     return results
 
 
-def _aggregate_size_strata(samples_list: list) -> dict:
-    strata: dict[str, dict] = defaultdict(lambda: {"n_gt": 0, "n_detected": 0})
-    for s in samples_list:
-        for label, data in s.get("by_size", {}).items():
-            strata[label]["n_gt"] += data["n_gt"]
-            strata[label]["n_detected"] += data["n_detected"]
-    return {
-        label: {
-            **data,
-            "recall": data["n_detected"] / data["n_gt"] if data["n_gt"] > 0 else 0.0
-        }
-        for label, data in strata.items()
-    }
-
-
 def _print_table(results: dict) -> None:
-    sep = "-" * 80
-    print(f"\n{'Building-level metrics (IoU threshold='}{results['iou_threshold']}){'':^20}")
+    sep = "-" * 90
+    thr = results["iou_threshold"]
+    print(f"\n{'Building-level metrics':^90}  (IoU threshold={thr})")
     print(sep)
-    print(f"{'City':<14} {'N':>5}  {'Prec':>7} {'Recall':>7} {'F1':>7}  "
-          f"{'mIoU':>7} {'Miss%':>7} {'FAlarm%':>8}")
+    print(
+        f"{'City':<14}  "
+        f"{'── raw vectorized ──':^32}  "
+        f"{'── clean (simplified) ──':^34}"
+    )
+    print(
+        f"{'':14}  "
+        f"{'Prec':>7} {'Recall':>7} {'F1':>7} {'mIoU':>7}  "
+        f"{'Prec':>7} {'Recall':>7} {'F1':>7} {'mIoU':>7}  "
+        f"{'ΔRecall':>8}"
+    )
     print(sep)
-
+ 
+    def _row(name, raw, clean):
+        delta = clean["recall"] - raw["recall"]
+        return (
+            f"{name:<14}  "
+            f"{raw['precision']:>7.3f} {raw['recall']:>7.3f} "
+            f"{raw['f1']:>7.3f} {raw['mean_iou_matched']:>7.3f}  "
+            f"{clean['precision']:>7.3f} {clean['recall']:>7.3f} "
+            f"{clean['f1']:>7.3f} {clean['mean_iou_matched']:>7.3f}  "
+            f"{delta:>+8.3f}"
+        )
+ 
     for city, data in results["per_city"].items():
-        print(f"{city:<14} {data['n_samples']:>5}  "
-              f"{data['precision']:>7.3f} {data['recall']:>7.3f} {data['f1']:>7.3f}  "
-              f"{data['mean_iou_matched']:>7.3f} "
-              f"{100*data['miss_rate']:>6.1f}% "
-              f"{100*data['false_alarm_rate']:>7.1f}%")
-
-    if results.get("overall"):
-        ov = results["overall"]
+        if data["raw"] and data["clean"]:
+            print(_row(city, data["raw"], data["clean"]))
+ 
+    if results.get("overall") and results["overall"].get("raw"):
         print(sep)
-        print(f"{'OVERALL':<14} {'':>5}  "
-              f"{ov['precision']:>7.3f} {ov['recall']:>7.3f} {ov['f1']:>7.3f}  "
-              f"{ov['mean_iou_matched']:>7.3f} "
-              f"{100*ov['miss_rate']:>6.1f}% "
-              f"{100*ov['false_alarm_rate']:>7.1f}%")
-
-        if "by_size" in ov:
-            print("\n  Size-stratified recall:")
-            for label, data in ov["by_size"].items():
-                print(f"    {label:<8}: {data['recall']:.3f}  "
-                      f"({data['n_detected']}/{data['n_gt']} buildings detected)")
+        print(_row("OVERALL", results["overall"]["raw"], results["overall"]["clean"]))
+ 
+        ov = results["overall"]
+        if "by_size" in ov.get("raw", {}):
+            print("\n  Size-stratified recall (raw -> clean):")
+            for label in SIZE_BINS:
+                r_data = ov["raw"].get("by_size", {}).get(label, {})
+                c_data = ov["clean"].get("by_size", {}).get(label, {})
+                if r_data:
+                    print(
+                        f"    {label:<8}: "
+                        f"{r_data.get('recall', 0):.3f} → {c_data.get('recall', 0):.3f}  "
+                        f"({r_data.get('n_detected',0)}/{r_data.get('n_gt',0)} → "
+                        f"{c_data.get('n_detected',0)}/{c_data.get('n_gt',0)})"
+                    )
     print(sep)
