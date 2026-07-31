@@ -223,7 +223,7 @@ def _print_table(results: dict) -> None:
     print(sep)
     for r in results["min_area_m2"]:
         print(
-            f"  {r['min_area_m2']:.0f}m²{'':<15}"
+            f"  {r['min_area_m2']:.0f}m2{'':<15}"
             f"{r['building_recall']:>10.4f} {r['building_precision']:>10.4f} "
             f"{r['building_f1']:>8.4f} {r['building_mean_iou']:>10.4f} "
             f"{r['pixel_iou']:>9.4f}"

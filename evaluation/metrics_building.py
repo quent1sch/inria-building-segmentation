@@ -405,8 +405,8 @@ def _print_table(results: dict) -> None:
                 if r_data:
                     print(
                         f"    {label:<8}: "
-                        f"{r_data.get('recall', 0):.3f} → {c_data.get('recall', 0):.3f}  "
-                        f"({r_data.get('n_detected',0)}/{r_data.get('n_gt',0)} → "
+                        f"{r_data.get('recall', 0):.3f} -> {c_data.get('recall', 0):.3f}  "
+                        f"({r_data.get('n_detected',0)}/{r_data.get('n_gt',0)} -> "
                         f"{c_data.get('n_detected',0)}/{c_data.get('n_gt',0)})"
                     )
     print(sep)
