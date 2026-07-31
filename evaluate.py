@@ -47,7 +47,7 @@ Usage examples
       --eval resolution
 
   # Other...
-  # python evaluation_test.py --checkpoint checkpoints/best_model.pth --mode custom --images data/swisstopo/SWISSIMAGE/ --gt data/swisstopo/swissTLM3D/swissTLM3D_2026_LV95_LN02.gdb --max-samples 1 --eval resolution
+  # python evaluate.py --checkpoint checkpoints/best_model.pth --mode custom --images data/swisstopo/SWISSIMAGE/ --gt data/swisstopo/swissTLM3D/swissTLM3D_2026_LV95_LN02.gdb --max-samples 1 --eval resolution
  
   # Multiple cities, limit samples per city for speed
   python evaluate.py
@@ -254,51 +254,51 @@ def main():
             from evaluation import resolution_robustness
             resolution_robustness.run(samples, model, out_dir)
     
-    # # ── qualitative grid ──────────────────────────────────────────────────
-    # print(f"\n{'='*60}")
-    # print("  Module: QUALITATIVE GRID")
-    # print(f"{'='*60}")
+    # ── qualitative grid ──────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("  Module: QUALITATIVE GRID")
+    print(f"{'='*60}")
  
-    # from evaluation import visualisation
-    # from api.vectorize import vectorize, polygons_to_mask
+    from evaluation import visualisation
+    from api.vectorize import vectorize, polygons_to_mask
  
-    # qual_dir = out_dir / "qualitative"
-    # city_samples: dict[str, list] = {}
+    qual_dir = out_dir / "qualitative"
+    city_samples: dict[str, list] = {}
  
-    # for sample in load_samples(args, cfg):
-    #     mask, _ = model.predict(
-    #         sample.image,
-    #         input_resolution=sample.resolution,
-    #         resample=True,
-    #     )
-    #     geojson    = vectorize(mask, resolution=sample.resolution,
-    #                            simplify_tolerance_m=args.simplify_tolerance,
-    #                            min_area_m2=args.min_area)
-    #     H, W       = sample.image.shape[:2]
-    #     clean_mask = polygons_to_mask(geojson, height=H, width=W)
+    for sample in load_samples(args, cfg):
+        mask, _ = model.predict(
+            sample.image,
+            input_resolution=sample.resolution,
+            resample=True,
+        )
+        geojson    = vectorize(mask, resolution=sample.resolution,
+                               simplify_tolerance_m=args.simplify_tolerance,
+                               min_area_m2=args.min_area)
+        H, W       = sample.image.shape[:2]
+        clean_mask = polygons_to_mask(geojson, height=H, width=W)
  
-    #     city_samples.setdefault(sample.city, []).append({
-    #         "image":      sample.image,
-    #         "gt_mask":    sample.gt_mask,
-    #         "raw_mask":   mask,
-    #         "clean_mask": clean_mask,
-    #         "name":       sample.name,
-    #     })
+        city_samples.setdefault(sample.city, []).append({
+            "image":      sample.image,
+            "gt_mask":    sample.gt_mask,
+            "raw_mask":   mask,
+            "clean_mask": clean_mask,
+            "name":       sample.name,
+        })
  
-    # for city, s_list in city_samples.items():
-    #     visualisation.save_prediction_grid(s_list, qual_dir, city=city)
+    for city, s_list in city_samples.items():
+        visualisation.save_prediction_grid(s_list, qual_dir, city=city)
  
-    # # ── report ────────────────────────────────────────────────────────────
-    # visualisation.generate_report(
-    #     out_dir=out_dir,
-    #     mode=args.mode,
-    #     eval_modules=modules,
-    #     checkpoint_path=args.checkpoint,
-    # )
+    # ── report ────────────────────────────────────────────────────────────
+    visualisation.generate_report(
+        out_dir=out_dir,
+        mode=args.mode,
+        eval_modules=modules,
+        checkpoint_path=args.checkpoint,
+    )
  
-    # print(f"\n{'='*60}")
-    # print(f"  Evaluation complete. Results in: {out_dir}")
-    # print(f"{'='*60}\n")
+    print(f"\n{'='*60}")
+    print(f"  Evaluation complete. Results in: {out_dir}")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
