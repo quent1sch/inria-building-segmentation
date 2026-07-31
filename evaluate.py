@@ -1,214 +1,304 @@
 """
 evaluate.py
-
-Post-training evaluation on the validation set.
-- Per-city metrics (IoU - Intersection over Union, Dice, Precision, Recall)
-- Qualitative grid: image | ground-truth | prediction overlay
-- Saves results to outputs/evaluation/
-
-Usage
+ 
+Evaluation pipeline for the Inria building segmentation model.
+ 
+Runs any combination of evaluation modules independently so each can be
+executed separately on CPU in acceptable time.
+ 
+Modes
 -----
-python evaluate.py --checkpoint checkpoints/best_model.pth
-python evaluate.py --checkpoint checkpoints/best_model.pth --config configs/config.yaml
+  inria   — Inria Aerial Image Labeling dataset test tiles (patched PNG crops)
+  custom  — SWISSIMAGE GeoTIFF tiles + swissTLM3D vector ground truth
+ 
+Evaluation modules
+------------------
+  pixel       Pixel-level IoU, Dice, Precision, Recall (raw vs clean)
+  building    Object-level detection metrics (polygon matching)
+  threshold   PR curve, ROC, optimal threshold sweep
+  postproc    Postprocessing parameter sensitivity (simplify + min_area)
+  resolution  Resolution robustness (native / resampled / simulated coarse)
+              — custom mode only, requires images with known resolution
+ 
+Usage examples
+--------------
+  # Inria — all modules
+  python evaluate.py
+      --checkpoint checkpoints/best_model.pth
+      --mode inria
+      --patches data/patches
+      --cities vienna
+ 
+  # Inria — pixel metrics only (fast)
+  python evaluate.py
+      --checkpoint checkpoints/best_model.pth
+      --mode inria
+      --patches data/patches
+      --cities vienna
+      --eval pixel
+ 
+  # Swisstopo custom — pixel + building + resolution
+  python evaluate.py
+      --checkpoint checkpoints/best_model.pth
+      --mode custom
+      --images path/to/swissimage_tiles/
+      --gt path/to/swissTLM3D_2026_LV95_LN02.gdb
+      --max-samples 3
+      --eval resolution
+
+  # Other...
+  # python evaluation_test.py --checkpoint checkpoints/best_model.pth --mode custom --images data/swisstopo/SWISSIMAGE/ --gt data/swisstopo/swissTLM3D/swissTLM3D_2026_LV95_LN02.gdb --max-samples 1 --eval resolution
+ 
+  # Multiple cities, limit samples per city for speed
+  python evaluate.py
+      --checkpoint checkpoints/best_model.pth
+      --mode inria
+      --patches data/patches
+      --cities vienna austin
+      --max-per-city 50
+      --eval pixel threshold
 """
-
+ 
 import argparse
+import sys
 from pathlib import Path
-
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
+ 
 import yaml
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-from data.dataset import InriaDataset
-from data.transforms import get_val_transforms
-from models.unet import UNetBuilding
-
-
-# ── metrics (same as train.py — kept here to avoid coupling) ─────────────────
-
-def compute_metrics_np(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
-    """Binary arrays (0/1)."""
-    tp = (pred_mask & gt_mask).sum()
-    fp = (pred_mask & ~gt_mask).sum()
-    fn = (~pred_mask & gt_mask).sum()
-
-    smooth = 1e-6
-    iou = (tp + smooth) / (tp + fp + fn + smooth)
-    dice = (2 * tp + smooth) / (2 * tp + fp + fn + smooth)
-    precision = (tp + smooth) / (tp + fp + smooth)
-    recall = (tp + smooth) / (tp + fn + smooth)
-
-    return {"iou": iou, "dice": dice, "precision": precision, "recall": recall}
-
-
-# ── visualisation helpers ─────────────────────────────────────────────────────
-
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
-IMAGENET_STD = np.array([0.229, 0.224, 0.225])
-
-
-def denormalize(tensor_chw: torch.Tensor) -> np.ndarray:
-    """CHW float tensor → HWC uint8 numpy for display."""
-    img = tensor_chw.cpu().numpy().transpose(1, 2, 0)
-    img = img * IMAGENET_STD + IMAGENET_MEAN
-    img = np.clip(img * 255, 0, 255).astype(np.uint8)
-    return img
-
-
-def overlay_mask(image: np.ndarray, pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
-    """
-    Returns an RGB overlay:
-      Green  = true positive
-      Red    = false positive
-      Blue   = false negative
-    """
-    overlay = image.copy()
-    tp = pred & gt
-    fp = pred & ~gt
-    fn = ~pred & gt
-
-    overlay[tp] = [0, 200, 0]
-    overlay[fp] = [200, 0, 0]
-    overlay[fn] = [0, 0, 200]
-
-    # Blend with original image
-    result = (0.5 * image + 0.5 * overlay).astype(np.uint8)
-    return result
-
-
-def save_qualitative_grid(samples: list, out_path: Path, n_cols: int = 4):
-    """
-    samples: list of (image_np, gt_mask_np, pred_mask_np) tuples
-    """
-    n = min(len(samples), n_cols * 4)
-    n_rows = (n + n_cols - 1) // n_cols
-
-    fig, axes = plt.subplots(n_rows * 3, n_cols, figsize=(n_cols * 3, n_rows * 9))
-    axes = np.array(axes).reshape(n_rows * 3, n_cols)
-
-    for i, (img, gt, pred) in enumerate(samples[:n]):
-        row_base = (i // n_cols) * 3
-        col = i % n_cols
-
-        axes[row_base, col].imshow(img)
-        axes[row_base, col].set_title("Image", fontsize=7)
-
-        axes[row_base + 1, col].imshow(gt, cmap="gray")
-        axes[row_base + 1, col].set_title("Ground Truth", fontsize=7)
-
-        axes[row_base + 2, col].imshow(overlay_mask(img, pred, gt))
-        axes[row_base + 2, col].set_title("Pred Overlay", fontsize=7)
-
-    for ax in axes.flat:
-        ax.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved qualitative grid → {out_path}")
-
-
-# ── main ─────────────────────────────────────────────────────────────────────
+ 
+AVAILABLE_MODULES = ["pixel", "building", "threshold", "postproc", "resolution"]
+INRIA_ONLY_MODULES = []
+CUSTOM_ONLY_MODULES = ["resolution"]
+ 
+ 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Building segmentation evaluation pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+ 
+    # ── required ──────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--checkpoint", required=True,
+        help="Path to best_model.pth",
+    )
+    parser.add_argument(
+        "--mode", required=True, choices=["inria", "custom"],
+        help="Data source: 'inria' (patched PNG crops) or 'custom' (SWISSIMAGE + TLM3D)",
+    )
+ 
+    # ── eval modules ──────────────────────────────────────────────────────
+    parser.add_argument(
+        "--eval", nargs="+",
+        choices=AVAILABLE_MODULES,
+        default=None,
+        help=(
+            "Evaluation modules to run. Default: all applicable. "
+            f"Choices: {AVAILABLE_MODULES}. "
+            "'resolution' requires --mode custom."
+        ),
+    )
+ 
+    # ── inria mode ────────────────────────────────────────────────────────
+    parser.add_argument("--patches", default="data/patches",
+                        help="Patches directory (inria mode)")
+    parser.add_argument("--cities", nargs="+", default=None,
+                        help="Cities to evaluate. Default: all cities in patches dir.")
+    parser.add_argument("--max-per-city", type=int, default=None,
+                        help="Max samples per city (for faster runs)")
+ 
+    # ── custom mode ───────────────────────────────────────────────────────
+    parser.add_argument("--images", default=None,
+                        help="Directory of SWISSIMAGE .tif tiles (custom mode)")
+    parser.add_argument("--gt", default=None,
+                        help="Path to swissTLM3D .gdb file (custom mode)")
+    parser.add_argument("--gt-layer", default="TLM_GEBAEUDE_FOOTPRINT",
+                        help="GDB layer name for building footprints")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Max total samples (custom mode, for faster runs)")
+ 
+    # ── postprocessing params ─────────────────────────────────────────────
+    parser.add_argument("--simplify-tolerance", type=float, default=0.5,
+                        help="Douglas-Peucker epsilon in metres (default 0.5)")
+    parser.add_argument("--min-area", type=float, default=10.0,
+                        help="Minimum building area in m² (default 10.0)")
+ 
+    # ── output ────────────────────────────────────────────────────────────
+    parser.add_argument("--out-dir", default="outputs/evaluation",
+                        help="Output directory for results")
+    parser.add_argument("--config", default="configs/config.yaml",
+                        help="Config file path")
+ 
+    return parser.parse_args()
+ 
+ 
+def load_samples(args, cfg):
+    """Build the sample iterable for the selected mode."""
+    from evaluation.ground_truth import (
+        #InriaDataset,
+        load_inria_samples,
+        load_swissimage_samples,
+    )
+ 
+    if args.mode == "inria":
+        from data.dataset import InriaDataset
+        patches_dir = Path(args.patches)
+ 
+        if args.cities:
+            cities = args.cities
+        else:
+            from evaluation.ground_truth import load_inria_samples
+            cities = [
+                d.name for d in patches_dir.iterdir() if d.is_dir()
+            ]
+            cities = sorted(cities)
+            print(f"Auto-detected cities: {cities}")
+ 
+        return load_inria_samples(
+            patches_dir,
+            cities=cities,
+            max_per_city=args.max_per_city,
+        )
+ 
+    else:  # custom
+        if not args.images:
+            print("Error: --images is required for --mode custom", file=sys.stderr)
+            sys.exit(1)
+        if not args.gt:
+            print("Error: --gt is required for --mode custom", file=sys.stderr)
+            sys.exit(1)
+ 
+        return load_swissimage_samples(
+            images_dir=args.images,
+            gdb_path=args.gt,
+            gdb_layer=args.gt_layer,
+            max_samples=args.max_samples,
+        )
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, help="Path to best_model.pth")
-    parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--out-dir", default="outputs/evaluation")
-    parser.add_argument("--n-vis", type=int, default=16,
-                        help="Number of samples to visualise")
-    args = parser.parse_args()
-
+    args = parse_args()
+ 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── model ────────────────────────────────────────────────────────────
-    model = UNetBuilding.load(args.checkpoint, device=device)
-    print(f"Loaded checkpoint: {args.checkpoint}")
-
-    # ── evaluate per city ────────────────────────────────────────────────
-    val_cities = cfg["data"]["val_cities"]
-    mean = cfg["data"]["mean"]
-    std = cfg["data"]["std"]
-    size = cfg["data"]["image_size"]
-    threshold = cfg["inference"]["threshold"]
-
-    city_results = {}
-    all_samples = []
-
-    for city in val_cities:
-        dataset = InriaDataset(
-            cfg["data"]["patches_dir"],
-            cities=[city],
-            transform=get_val_transforms(image_size=size, mean=mean, std=std),
-        )
-        loader = DataLoader(dataset, 
-                            batch_size=8, 
-                            shuffle=False, 
-                            num_workers=2)
-
-        city_metrics = {"iou": [], "dice": [], "precision": [], "recall": []}
-
-        with torch.no_grad():
-            for images, masks in tqdm(loader, desc=f"  {city}"):
-                images = images.to(device)
-                logits = model(images)
-                probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
-                masks_np = masks.cpu().numpy().astype(bool)
-
-                for i in range(len(images)):
-                    pred = probs[i] > threshold
-                    gt = masks_np[i]
-                    m = compute_metrics_np(pred, gt)
-                    for k in city_metrics:
-                        city_metrics[k].append(m[k])
-
-                    # Collect samples for visualisation
-                    if len(all_samples) < args.n_vis:
-                        img_np = denormalize(images[i].cpu())
-                        all_samples.append((img_np, gt, pred))
-
-        city_results[city] = {k: np.mean(v) for k, v in city_metrics.items()}
-
-    # ── print results table ──────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print(f"{'City':<14} {'IoU':>8} {'Dice':>8} {'Precision':>10} {'Recall':>8}")
-    print("-" * 60)
-
-    ious, dices = [], []
-    for city, m in city_results.items():
-        print(
-            f"{city:<14} {m['iou']:>8.4f} {m['dice']:>8.4f} "
-            f"{m['precision']:>10.4f} {m['recall']:>8.4f}"
-        )
-        ious.append(m["iou"])
-        dices.append(m["dice"])
-
-    print("-" * 60)
-    print(
-        f"{'Mean':<14} {np.mean(ious):>8.4f} {np.mean(dices):>8.4f}"
+    # ── load model ────────────────────────────────────────────────────────
+    print(f"\nLoading model from: {args.checkpoint}")
+    from api.inference import SegmentationInference
+    model = SegmentationInference(
+        checkpoint_path=args.checkpoint,
+        config_path=args.config,
+        device="auto",
     )
-    print("=" * 60)
 
-    # ── save results ────────────────────────────────────────────────────
-    import json
-    results_path = out_dir / "metrics.json"
-    with open(results_path, "w") as f:
-        json.dump(city_results, f, indent=2)
-    print(f"\nMetrics saved → {results_path}")
 
-    # ── qualitative grid ─────────────────────────────────────────────────
-    save_qualitative_grid(all_samples, out_dir / "predictions_grid.png")
+    # ── resolve modules to run ────────────────────────────────────────────
+    if args.eval:
+        modules = args.eval
+    else:
+        modules = [m for m in AVAILABLE_MODULES
+                   if m not in CUSTOM_ONLY_MODULES or args.mode == "custom"]
+ 
+    # Validate mode compatibility
+    for m in modules:
+        if m in CUSTOM_ONLY_MODULES and args.mode != "custom":
+            print(f"Warning: module '{m}' requires --mode custom — skipping.")
+            modules = [x for x in modules if x != m]
+ 
+    print(f"Mode: {args.mode}")
+    print(f"Modules: {modules}")
+    print(f"Out dir: {args.out_dir}\n")
+ 
+    out_dir = Path(args.out_dir)
 
+
+    # ── run modules ───────────────────────────────────────────────────────
+    # Samples is a generator. Each module that needs it gets a fresh one
+    # (generators can only be consumed once, so we rebuild per module)
+ 
+    for module_name in modules:
+        print(f"\n{'='*60}")
+        print(f"  Module: {module_name.upper()}")
+        print(f"{'='*60}")
+ 
+        # Rebuild sample iterator for each module
+        samples = load_samples(args, cfg)
+        print("sample interator built")
+ 
+        if module_name == "pixel":
+            print(f"starting {module_name.upper()} evaluation module")
+            from evaluation import metrics_pixel
+            metrics_pixel.run(
+                samples, model, out_dir,
+                postprocess=True,
+                simplify_tolerance_m=args.simplify_tolerance,
+                min_area_m2=args.min_area,
+            )
+ 
+        elif module_name == "building":
+            from evaluation import metrics_building
+            metrics_building.run(
+                samples, model, out_dir,
+                simplify_tolerance_m=args.simplify_tolerance,
+                min_area_m2=args.min_area,
+            )
+
+        elif module_name == "threshold":
+            from evaluation import threshold_analysis
+            threshold_analysis.run(samples, model, out_dir)
+
+        elif module_name == "postproc":
+            from evaluation import postproc_sensitivity
+            postproc_sensitivity.run(samples, model, out_dir)
+
+        elif module_name == "resolution":
+            from evaluation import resolution_robustness
+            resolution_robustness.run(samples, model, out_dir)
+    
+    # # ── qualitative grid ──────────────────────────────────────────────────
+    # print(f"\n{'='*60}")
+    # print("  Module: QUALITATIVE GRID")
+    # print(f"{'='*60}")
+ 
+    # from evaluation import visualisation
+    # from api.vectorize import vectorize, polygons_to_mask
+ 
+    # qual_dir = out_dir / "qualitative"
+    # city_samples: dict[str, list] = {}
+ 
+    # for sample in load_samples(args, cfg):
+    #     mask, _ = model.predict(
+    #         sample.image,
+    #         input_resolution=sample.resolution,
+    #         resample=True,
+    #     )
+    #     geojson    = vectorize(mask, resolution=sample.resolution,
+    #                            simplify_tolerance_m=args.simplify_tolerance,
+    #                            min_area_m2=args.min_area)
+    #     H, W       = sample.image.shape[:2]
+    #     clean_mask = polygons_to_mask(geojson, height=H, width=W)
+ 
+    #     city_samples.setdefault(sample.city, []).append({
+    #         "image":      sample.image,
+    #         "gt_mask":    sample.gt_mask,
+    #         "raw_mask":   mask,
+    #         "clean_mask": clean_mask,
+    #         "name":       sample.name,
+    #     })
+ 
+    # for city, s_list in city_samples.items():
+    #     visualisation.save_prediction_grid(s_list, qual_dir, city=city)
+ 
+    # # ── report ────────────────────────────────────────────────────────────
+    # visualisation.generate_report(
+    #     out_dir=out_dir,
+    #     mode=args.mode,
+    #     eval_modules=modules,
+    #     checkpoint_path=args.checkpoint,
+    # )
+ 
+    # print(f"\n{'='*60}")
+    # print(f"  Evaluation complete. Results in: {out_dir}")
+    # print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
