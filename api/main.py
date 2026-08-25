@@ -421,5 +421,5 @@ def health():
  
 @app.get("/", include_in_schema=False)
 def root():
-    return {"message": "Inria Building Segmentation API — see /docs for usage."}
+    return {"message": "Inria Building Segmentation API — see /docs for usage and info."}
  
