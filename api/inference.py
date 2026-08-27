@@ -297,9 +297,6 @@ class SegmentationInference:
         size = self.tile_size
         step = size - self.overlap
 
-        # prob_acc = np.zeros((H, W), dtype=np.float32)
-        # count_acc = np.zeros((H, W), dtype=np.float32)
-
         # Pad image so every position is covered
         pad_h = max(0, size - H % step if H % step != 0 else 0)
         pad_w = max(0, size - W % step if W % step != 0 else 0)
@@ -312,7 +309,7 @@ class SegmentationInference:
 
         pH, pW = image.shape[:2]
         prob_acc = np.zeros((pH, pW), dtype=np.float32)
-        count_acc = np.zeros((pH, pW), dtype=np.float32)
+        count_acc = np.zeros((pH, pW), dtype=np.uint8)
 
         ys = list(range(0, pH - size + 1, step))
         xs = list(range(0, pW - size + 1, step))
@@ -329,11 +326,21 @@ class SegmentationInference:
                 prob = self._predict_tile(tile)
 
                 prob_acc[y:y + size, x:x + size] += prob
-                count_acc[y:y + size, x:x + size] += 1.0
+                count_acc[y:y + size, x:x + size] += 1
 
-        # Crop back to original size
+        # # Crop back to original size
+        # with np.errstate(divide="ignore", invalid="ignore"):
+        #     prob_map = np.where(count_acc > 0, prob_acc / count_acc, 0.0)
+
+        # uses an in-place divide to avoid creating a new array. It's faster and uses less memory.
+        prob_map = prob_acc
         with np.errstate(divide="ignore", invalid="ignore"):
-            prob_map = np.where(count_acc > 0, prob_acc / count_acc, 0.0)
+            np.divide(
+                prob_map,
+                count_acc,
+                out=prob_map,
+                where=count_acc > 0,
+            )
 
         return prob_map[:H, :W]
     

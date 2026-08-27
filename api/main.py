@@ -180,17 +180,32 @@ def mask_to_png_bytes(mask: np.ndarray) -> bytes:
     return buf.getvalue()
     
 
+# def _raw_overlay(image: np.ndarray, mask: np.ndarray) -> bytes:
+#     """Original image with raw mask pixels highlighted in red."""
+
+#     overlay = image.copy()
+
+#     overlay[mask > 0] = np.clip(
+#         overlay[mask > 0].astype(int) * 0.5 + np.array([255, 50, 50]) * 0.5,
+#         0, 255,
+#     ).astype(np.uint8)
+#     buf = io.BytesIO()
+#     Image.fromarray(overlay, mode="RGB").save(buf, format="PNG")
+#     return buf.getvalue()
+
+
 def _raw_overlay(image: np.ndarray, mask: np.ndarray) -> bytes:
-    """Original image with raw mask pixels highlighted in red."""
-    overlay = image.copy()
-    overlay[mask > 0] = np.clip(
-        overlay[mask > 0].astype(int) * 0.5 + np.array([255, 50, 50]) * 0.5,
-        0, 255,
+    image[mask > 0] = np.clip(
+        image[mask > 0].astype(int) * 0.5
+        + np.array([255, 50, 50]) * 0.5,
+        0,
+        255,
     ).astype(np.uint8)
+
     buf = io.BytesIO()
-    Image.fromarray(overlay, mode="RGB").save(buf, format="PNG")
+    Image.fromarray(image, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
- 
+
  
 def _vector_overlay(image: np.ndarray, geojson: dict) -> bytes:
     """
