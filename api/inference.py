@@ -1,12 +1,26 @@
 """
 api/inference.py
 
-Inference wrapper with embedded formatting pipeline and sliding-window support for large images.
+Inference wrapper with embedded formatting pipeline, resolution-aware preprocessing 
+and sliding-window support for large images.
 
-The model was trained on 512×512 patches; for larger inputs (e.g. a full
-5000×5000 Inria tile) we tile the image, run inference on each tile, and
+The model was trained on 512x512 patches; for larger inputs (e.g. a full
+5000x5000 Inria tile) we tile the image, run inference on each tile, and
 stitch the predictions back with overlap-based averaging to avoid
 boundary artefacts.
+
+Memory management for large inputs
+------------------------------------
+Large GeoTIFF tiles (e.g., 10kx10k) require careful memory handling. 
+Key design decisions:
+ 
+  - Large TIFFs are written to a temp file instead of io.BytesIO so the
+    OS can page them rather than holding everything in RAM simultaneously.
+  - uint16 -> uint8 conversion uses right-shift (>> 8) instead of a float32
+    intermediate, saving ~1.2 GB peak RAM for a 10kx10k 3-band image.
+  - Padded image and intermediate arrays are explicitly deleted after use.
+  - TTA is automatically skipped for images above TTA_MAX_PIXELS to avoid
+    doubling inference memory on large tiles.
 
 Resolution handling
 -------------------
@@ -39,6 +53,8 @@ Image format handling
 """
 
 import io
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -53,7 +69,6 @@ from models.unet import UNetBuilding
 
 try:
     import rasterio
-    from rasterio.enums import Resampling as RasterioResampling
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
@@ -62,6 +77,10 @@ except ImportError:
 SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
  
 TRAINING_RESOLUTION = 0.3 # metres per pixel
+
+# Images above this pixel count skip TTA to avoid doubling memory.
+# 4096×4096 =~ 16M pixels. Adjust in config if needed.
+TTA_MAX_PIXELS = 4096 * 4096
  
  
 # ── result dataclass ──────────────────────────────────────────────────────────
@@ -100,6 +119,15 @@ def read_image_bytes(
       - 16-bit -> 8-bit normalisation
       - Multi-band (>3) -> first 3 bands kept
       - Single-band -> replicated to 3 channels
+
+    Large TIFF handling
+    -------------------
+    For TIFFs, writes bytes to a temp file before opening with rasterio.
+    io.BytesIO pins the entire compressed file in RAM while rasterio also
+    holds the decompressed array — for a 10k×10k 16-bit tile that can
+    exceed 2 GB simultaneously. A temp file lets the OS page the compressed
+    data out, reducing peak RAM significantly.
+    The temp file is always deleted in the finally block.
     """
     suffix = Path(filename).suffix.lower()
  
@@ -113,33 +141,38 @@ def read_image_bytes(
  
     # ── GeoTIFF: use rasterio for metadata + 16-bit support ──────────────
     if suffix in (".tif", ".tiff") and HAS_RASTERIO:
-        with rasterio.open(io.BytesIO(data)) as src:
-            # Read all bands as (bands, H, W)
-            arr = src.read()
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        del data # release compressed bytes before rasterio reads
  
-            # Extract pixel resolution if CRS is projected (units = metres)
-            try:
-                if src.crs and src.crs.is_projected:
-                    res_x, res_y = src.res   # (metres/pixel x, metres/pixel y)
-                    auto_resolution = float((res_x + res_y) / 2)
-            except Exception:
-                pass   # silently skip if metadata is incomplete
+        try:
+            with rasterio.open(tmp_path) as src:
+                arr = src.read() # (C, H, W)
+                try:
+                    if src.crs and src.crs.is_projected:
+                        res_x, res_y = src.res
+                        auto_resolution = float((res_x + res_y) / 2)
+                except Exception:
+                    pass
+        finally:
+            os.unlink(tmp_path)
  
         image = _bands_to_rgb_uint8(arr)
+        del arr
  
-    # ── All other formats: Pillow ─────────────────────────────────────────
     else:
         pil_img = Image.open(io.BytesIO(data))
         arr = np.array(pil_img)
+        del data
  
         if arr.ndim == 2:
-            # Grayscale -> (1, H, W)
             arr = arr[np.newaxis, ...]
         elif arr.ndim == 3:
-            # HWC -> CHW
             arr = arr.transpose(2, 0, 1)
  
         image = _bands_to_rgb_uint8(arr)
+        del arr
  
     return image, auto_resolution
  
@@ -148,11 +181,10 @@ def _bands_to_rgb_uint8(arr: np.ndarray) -> np.ndarray:
     """
     (C, H, W) array of any dtype -> (H, W, 3) uint8 RGB.
  
-    Rules:
-      - 16-bit (uint16): scale to [0, 255]
-      - >3 bands: keep first 3
-      - 1 band (grayscale): replicate to 3 channels
-      - Already 3 bands uint8: pass through
+    uint16 → uint8 via right-shift (>> 8) instead of float32 cast.
+    For a 10kx10k 3-band image this avoids a ~1.2 GB float32 intermediate.
+    >> 8 divides by 256 (vs / 65535 * 255), error is =< 0.4% - negligible
+    for inference.
     """
     C = arr.shape[0]
  
@@ -164,7 +196,7 @@ def _bands_to_rgb_uint8(arr: np.ndarray) -> np.ndarray:
  
     # dtype normalisation
     if arr.dtype == np.uint16:
-        arr = (arr.astype(np.float32) / 65535.0 * 255.0).astype(np.uint8)
+        arr = (arr >> 8).astype(np.uint8)
     elif arr.dtype != np.uint8:
         # generic: clip and scale to 0-255
         arr = arr.astype(np.float32)
@@ -199,8 +231,7 @@ def resample_image(
  
     # Use INTER_AREA for downscaling (best for aerial), INTER_CUBIC for up
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-    resampled = cv2.resize(image, (new_W, new_H), interpolation=interp)
-    return resampled
+    return cv2.resize(image, (new_W, new_H), interpolation=interp)
  
  
 def upsample_prob(
@@ -265,24 +296,21 @@ class SegmentationInference:
     def _normalize(self, image: np.ndarray) -> np.ndarray:
         """HWC uint8 -> HWC float32 normalised with ImageNet stats."""
         img = image.astype(np.float32) / 255.0
-        img = (img - self.mean) / self.std
-        return img
+        return (img - self.mean) / self.std
 
     def _to_tensor(self, image: np.ndarray) -> torch.Tensor:
         """HWC float32 -> 1CHW torch.Tensor."""
-        img = self._normalize(image)
-        tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
-        return tensor.to(self.device)
+        return torch.from_numpy(
+            self._normalize(image).transpose(2, 0, 1)
+            ).unsqueeze(0).to(self.device)
 
     # ── single-tile inference ─────────────────────────────────────────────
 
     @torch.no_grad()
     def _predict_tile(self, tile: np.ndarray) -> np.ndarray:
         """Predict probability map for a single HWC tile."""
-        t = self._to_tensor(tile)
-        logit = self.model(t) # (1, 1, H, W)
-        prob = torch.sigmoid(logit).squeeze().cpu().numpy()
-        return prob # (H, W) float32 in [0, 1]
+        logit = self.model(self._to_tensor(tile))
+        return torch.sigmoid(logit).squeeze().cpu().numpy() # (H, W) float32 in [0, 1]
 
     # ── sliding-window inference ──────────────────────────────────────────
 
@@ -309,7 +337,7 @@ class SegmentationInference:
 
         pH, pW = image.shape[:2]
         prob_acc = np.zeros((pH, pW), dtype=np.float32)
-        count_acc = np.zeros((pH, pW), dtype=np.uint8)
+        count_acc = np.zeros((pH, pW), dtype=np.uint16)
 
         ys = list(range(0, pH - size + 1, step))
         xs = list(range(0, pW - size + 1, step))
@@ -322,27 +350,15 @@ class SegmentationInference:
 
         for y in ys:
             for x in xs:
-                tile = image[y:y + size, x:x + size]
-                prob = self._predict_tile(tile)
-
-                prob_acc[y:y + size, x:x + size] += prob
-                count_acc[y:y + size, x:x + size] += 1
-
-        # # Crop back to original size
-        # with np.errstate(divide="ignore", invalid="ignore"):
-        #     prob_map = np.where(count_acc > 0, prob_acc / count_acc, 0.0)
-
-        # uses an in-place divide to avoid creating a new array. It's faster and uses less memory.
-        prob_map = prob_acc
-        with np.errstate(divide="ignore", invalid="ignore"):
-            np.divide(
-                prob_map,
-                count_acc,
-                out=prob_map,
-                where=count_acc > 0,
-            )
-
-        return prob_map[:H, :W]
+                prob_acc[y:y+size, x:x+size]  += self._predict_tile(image[y:y+size, x:x+size])
+                count_acc[y:y+size, x:x+size] += 1
+ 
+        del image   # free padded copy before division
+ 
+        np.divide(prob_acc, count_acc, out=prob_acc, where=count_acc > 0)
+        del count_acc
+ 
+        return prob_acc[:H, :W]
     
 
     # ── core predict (pixel-level) ────────────────────────────────────────
@@ -354,6 +370,9 @@ class SegmentationInference:
         Thresholding is intentionally deferred to predict() so it happens
         AFTER any upsampling - applying threshold before upsampling would
         produce jagged/rounded edges on building contours.
+
+        TTA is skipped automatically for images > TTA_MAX_PIXELS to avoid
+        doubling memory on large tiles.
         """
         H, W = image.shape[:2]
  
@@ -365,17 +384,19 @@ class SegmentationInference:
         else:
             prob = self._sliding_window_predict(image)
 
-        if self.use_tta:
+        use_tta = self.use_tta and (H * W) <= TTA_MAX_PIXELS
+        if use_tta:
             # Average with TTA predictions on the same (possibly padded) input
             pad_h = max(0, self.tile_size - H)
             pad_w = max(0, self.tile_size - W)
             padded = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
             tensor = self._to_tensor(padded)
-            tta_mask = self.model.predict_tta(tensor, threshold=self.threshold)
-            tta_prob = tta_mask.float().squeeze().cpu().numpy()[:H, :W]
+            del padded # free padded copy before TTA
+            tta_prob = self.model.predict_tta(tensor).float().squeeze().cpu().numpy()[:H, :W]
 
             # Combine: if either standard or TTA prob agrees, trust the average
             prob = (prob + tta_prob) / 2.0
+            del tta_prob
  
         return prob # float32, NOT thresholded
  
@@ -425,7 +446,8 @@ class SegmentationInference:
         # Resample down to target resolution
         original_h, original_w = image.shape[:2]
         resampled_image = resample_image(image, input_resolution, tgt)
-        info.resampled    = True
+        del image # free original copy before inference
+        info.resampled = True
         info.resampled_to = tgt
         return resampled_image, info, original_h, original_w
  
@@ -464,6 +486,7 @@ class SegmentationInference:
             orig_h, orig_w = original_h, original_w
  
         prob = self._predict_array(proc_image) # float32 probability map
+        del proc_image # free preprocessed copy before upsampling
  
         # Upsample probability map BEFORE thresholding (if resampling).
         # This preserves smooth boundary gradients so the final threshold
@@ -472,6 +495,7 @@ class SegmentationInference:
             prob = upsample_prob(prob, orig_h, orig_w)
 
         mask = prob > self.threshold # threshold last, at full resolution
+        del prob # free probability map before returning
  
         return mask, info
  
