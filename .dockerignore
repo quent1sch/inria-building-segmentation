@@ -1,0 +1,40 @@
+# Training data — largest contributor to image size
+<!-- data/raw/
+data/patches/
+data/swisstopo/swissTLM3D/ -->
+data/
+
+# Checkpoints - mounted at runtime via docker-compose volume, not baked in.
+checkpoints/last_checkpoint.pth
+
+# MLflow — runtime artefact, not needed in container
+mlruns/
+mlruns.db
+
+# Training + evaluation — not needed for serving
+train.py
+evaluate.py
+evaluation/
+notebooks/
+scripts/
+outputs/
+
+# Dev / repo artefacts
+.git/
+.gitignore
+*.md
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store

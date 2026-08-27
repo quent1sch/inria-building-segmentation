@@ -42,7 +42,7 @@ env/
 Thumbs.db
 
 # Docker
-.dockerignore
+#.dockerignore
 
 # dev support notebook
 play.ipynb
