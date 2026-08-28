@@ -1,7 +1,4 @@
 # Training data — largest contributor to image size
-<!-- data/raw/
-data/patches/
-data/swisstopo/swissTLM3D/ -->
 data/
 
 # Checkpoints - mounted at runtime via docker-compose volume, not baked in.
