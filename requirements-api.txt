@@ -1,0 +1,38 @@
+# Core ML
+segmentation-models-pytorch>=0.3.3
+albumentations>=1.4.0
+opencv-python-headless>=4.9.0
+Pillow>=10.2.0
+numpy>=1.26.0
+rasterio>=1.3.9
+
+# GIS / vectorization
+shapely>=2.0.0
+geopandas>=0.14.0
+
+# API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Config
+pydantic-settings>=2.0.0
+PyYAML>=6.0.1
+
+# Database (async)
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0 # SQLite async driver (local)
+# asyncpg>=0.29.0 # PostgreSQL async driver (uncomment for cloud)
+
+# Storage
+aiofiles>=23.2.1 # async local file I/O
+httpx>=0.27.0 # async HTTP for from-url downloads
+
+# Azure (uncomment when STORAGE_BACKEND=azure or WORKER_MODE=queue)
+# azure-storage-blob>=12.19.0
+# azure-storage-queue>=12.9.0
+
+# Utilities
+tqdm>=4.66.0
+
+
