@@ -1,440 +1,922 @@
 """
 api/main.py
 
-FastAPI application exposing the building segmentation model as a REST API.
+FastAPI application — building segmentation as a service.
 
 Endpoints
 ---------
-POST /predict              — building mask PNG
-POST /predict/overlay      — original image with buildings highlighted PNG
-POST /predict/vector       — GeoJSON FeatureCollection of building polygons
+Sync (returns result directly):
+  POST /predict/upload          multipart file upload — for small/medium images
+  POST /predict/from-path       path to file inside container (best for large tiles,
+                                zero upload buffering — rasterio opens direct from disk)
+  POST /predict/from-url        download from URL (Azure Blob SAS, public URL)
+                                streamed chunk by chunk to minimise peak RAM
+
+Async (returns job_id immediately, result fetched later):
+  POST /predict/async/upload
+  POST /predict/async/from-path
+  POST /predict/async/from-url
+  → all return {"job_id": "...", "status": "queued", "poll_url": "/jobs/{job_id}"}
+
+Job management:
+  GET  /jobs/{job_id}           job status + result URL when done
+  GET  /jobs/{job_id}/result    stream result (local) or redirect to SAS URL (Azure)
+  GET  /jobs/                   list recent jobs for current user
+
+Results (local storage only):
+  GET  /results/{key}           stream result file from local storage
+                                (in Azure mode, clients use the SAS URL directly)
+
+Health:
+  GET  /health                  DB + storage + model reachability
 
 Output processing levels
 -------------------------
   raw         Direct model output, thresholded.
-  clean       Vectorized (polygonized + simplified + filtered) then
-              rasterized back to a pixel mask.
-  vectorized  Vectorized polygon outlines — only meaningful for overlay.
- 
+              → pixel-perfect but may have jagged edges and small artefacts
+  clean       Vectorized (polygonize → Douglas-Peucker simplify → area filter)
+              then rasterized back to a pixel mask.
+              → straight building edges, noise removed
+  vectorized  Vectorized polygon outlines drawn over the image.
+              → only meaningful for overlay / result_type=overlay
+
 Applies to:
-  /predict        → ?processing=raw (default) | clean
-  /predict/overlay → ?processing=raw (default) | vectorized | clean
-  /predict/vector  → always vectorized (no param)
+  result_type=mask    → processing=raw (default) | clean
+  result_type=overlay → processing=raw (default) | vectorized | clean
+  result_type=vector  → always vectorized (no processing param)
 
-Resolution parameters (both endpoints)
----------------------------------------
-  ?resolution=0.15   metres/pixel of the input image.
-                     If omitted and the file is a GeoTIFF with embedded CRS,
-                     resolution is read automatically.
- 
-  ?resample=false    Disable resampling for finer-than-training images.
-                     Default: true (resample when beneficial).
- 
+Processing parameters (all input mode endpoints)
+-------------------------------------------------
+  resolution=0.15          metres/pixel of the input image.
+                           Auto-detected for GeoTIFF with embedded projected CRS.
+                           Omit for JPEG/PNG if unknown — no resampling applied.
 
-Vectorization parameters (/predict/vector and /predict/overlay?vectorized=true)
----------------------------------------------------------------------------------
-  ?simplify_tolerance=0.5   Douglas-Peucker epsilon in metres. Default 0.5.
-  ?min_area=10.0            Minimum building area in m². Default 10.0.
-                            Requires resolution to be known.
- 
+  resample=false           Disable resampling for finer-than-training images.
+                           Default: true — images finer than 0.3m/px are
+                           resampled to 0.3m/px before inference.
+
+  processing=raw           Output processing level (see above).
+  result_type=mask         Output format: mask | overlay | vector
+
+  simplify_tolerance=0.5   Douglas-Peucker epsilon in metres.
+                           Only used when processing=clean or result_type=vector.
+                           Controls straight-edge fitting on building outlines.
+
+  min_area=10.0            Minimum building footprint in m².
+                           Detections below this threshold are discarded as noise.
+                           Requires resolution to be known.
+
 Response headers (when resolution is known)
 -------------------------------------------
-  X-Input-Resolution   : detected or supplied resolution in m/px
-  X-Resampling-Applied : "true" / "false"
-  X-Resampled-To       : target resolution used (only when resampling applied)
-  X-Resolution-Warning : human-readable warning (only when applicable)
-  X-Building-Count      number of polygons (/predict/vector only)
+  X-Input-Resolution    detected or supplied resolution in m/px
+  X-Resampling-Applied  "true" / "false"
+  X-Resampled-To        target resolution used (only when resampling applied)
+  X-Resolution-Warning  warning when input is coarser than training resolution
+  X-Job-Id              job ID logged in DB for every sync request
+  X-Cache               "HIT" if result served from cache, "MISS" otherwise
+
+Auth
+----
+  Single-user local:  API_KEY env var empty (default) → no auth required,
+                      all requests attributed to DEFAULT_USER_ID="local"
+  Multi-user / cloud: set API_KEY → all requests must include
+                      X-API-Key: <value> header
+                      (replace with JWT/Azure AD in a full production setup)
+
+Cloud migration — env vars only, zero code changes
+----------------------------------------------------
+  Local defaults (no config needed):
+    STORAGE_BACKEND=local
+    DATABASE_URL=sqlite+aiosqlite:///jobs.db
+    WORKER_MODE=thread
+
+  Azure production:
+    STORAGE_BACKEND=azure
+    AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;...
+    AZURE_STORAGE_CONTAINER=segmentation-results
+    DATABASE_URL=postgresql+asyncpg://user:pass@host/dbname
+    WORKER_MODE=queue
+    AZURE_QUEUE_CONNECTION_STRING=...
+    AZURE_QUEUE_NAME=inference-jobs
 
 Usage
 -----
-uvicorn api.main:app --reload --port 8000
+  # Start locally
+  uvicorn api.main:app --reload --port 8000
 
-Examples
---------
-  # Raw mask
-  curl -X POST http://localhost:8000/predict \\
+  # Via Docker
+  docker compose up
+
+Examples — sync upload
+-----------------------
+  # Raw mask (multipart upload)
+  curl -X POST http://localhost:8000/predict/upload \
        -F "file=@tile.tif" --output mask.png
- 
-  # Clean mask (vectorized → rasterized)
-  curl -X POST "http://localhost:8000/predict?processing=clean&resolution=0.3" \\
-       -F "file=@tile.tif" --output clean_mask.png
- 
-  # Raw overlay
-  curl -X POST http://localhost:8000/predict/overlay \\
-       -F "file=@tile.tif" --output overlay.png
- 
-  # Overlay with clean polygon outlines
-  curl -X POST "http://localhost:8000/predict/overlay?processing=vectorized&resolution=0.3" \\
-       -F "file=@tile.tif" --output overlay_vector.png
- 
-  # Overlay with clean rasterized fill
-  curl -X POST "http://localhost:8000/predict/overlay?processing=clean&resolution=0.3" \\
-       -F "file=@tile.tif" --output overlay_clean.png
- 
+
+  # Clean mask (vectorized → rasterized), with known resolution
+  curl -X POST "http://localhost:8000/predict/upload" \
+       -F "file=@tile.tif" \
+       -F "resolution=0.3" -F "processing=clean" \
+       --output mask_clean.png
+
+  # Overlay with polygon outlines
+  curl -X POST "http://localhost:8000/predict/upload" \
+       -F "file=@tile.tif" \
+       -F "result_type=overlay" -F "processing=vectorized" -F "resolution=0.3" \
+       --output overlay.png
+
   # GeoJSON polygons
-  curl -X POST "http://localhost:8000/predict/vector?resolution=0.3" \\
-       -F "file=@tile.tif"
+  curl -X POST "http://localhost:8000/predict/upload" \
+       -F "file=@tile.tif" \
+       -F "result_type=vector" -F "resolution=0.3"
+
+Examples — from-path (best for large tiles, no upload buffering)
+-----------------------------------------------------------------
+  # Raw mask — file mounted at /data in container
+  curl -X POST http://localhost:8000/predict/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif"}' \
+       --output mask.png
+
+  # Clean mask with explicit resolution (SWISSIMAGE is 0.1m/px)
+  curl -X POST http://localhost:8000/predict/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "processing": "clean"}' \
+       --output mask_clean.png
+
+Examples — from-url (Azure Blob SAS or public URL)
+---------------------------------------------------
+  curl -X POST http://localhost:8000/predict/from-url \
+       -H "Content-Type: application/json" \
+       -d '{"url": "https://mystorage.blob.core.windows.net/tiles/tile.tif?sas_token=..."}' \
+       --output mask.png
+
+Examples — async (large images, non-blocking)
+---------------------------------------------
+  # Submit job
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1}' \
+  → {"job_id": "abc-123", "status": "queued", "poll_url": "/jobs/abc-123"}
+
+  # Poll status
+  curl http://localhost:8000/jobs/abc-123
+  → {"status": "done", "result_url": "/results/abc-123.png", ...}
+
+  # Download result
+  curl http://localhost:8000/jobs/abc-123/result --output mask.png
+
+  # Check headers for resampling info
+  curl -X POST http://localhost:8000/predict/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/tile.tif", "resolution": 0.1}' \
+       --output mask.png --dump-header -
+  → X-Input-Resolution: 0.1000
+    X-Resampling-Applied: true
+    X-Resampled-To: 0.3000
+    X-Job-Id: abc-123
+    X-Cache: MISS
 """
 
 import io
-from enum import Enum
+import json
+import os
+import tempfile
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, Response
-from PIL import Image, ImageDraw
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from PIL import Image as PILImage, ImageDraw
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.inference import ResolutionInfo, SegmentationInference, read_image_bytes
-from api.vectorize import geojson_to_bytes, polygons_to_mask, vectorize
+from api.inference import (
+    SegmentationInference,
+    _bands_to_rgb_uint8,
+    read_image_bytes,
+    ResolutionInfo,
+)
+from api.schemas import (
+    AsyncJobAccepted,
+    FromPathRequest,
+    FromUrlRequest,
+    HealthResponse,
+    InferenceParams,
+    JobResponse,
+)
+from api.vectorize import vectorize, polygons_to_mask
+from config import get_settings
+from db.crud import (
+    compute_input_hash,
+    create_job,
+    get_cached_result,
+    get_job,
+    hash_bytes,
+    list_jobs,
+    store_cached_result,
+    mark_done,
+)
+from db.models import InputMode, JobStatus, ResultType
+from db.session import db_session_dependency, init_db, close_db
+from storage import get_storage
+from worker.job_runner import run_job_async
+from worker.queue import get_queue
 
 
-# ── enums ─────────────────────────────────────────────────────────────────────
- 
-class MaskProcessing(str, Enum):
-    raw   = "raw"
-    clean = "clean"
- 
- 
-class OverlayProcessing(str, Enum):
-    raw        = "raw"
-    vectorized = "vectorized"
-    clean      = "clean"
+# ── app lifespan ──────────────────────────────────────────────────────────────
+
+_queue = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown logic."""
+    global _queue
+    settings = get_settings()
+
+    # Initialise DB tables
+    await init_db()
+
+    # Start worker queue (thread mode: starts background task;
+    # queue mode: worker runs in separate container, this is a no-op)
+    if settings.worker_mode == "thread":
+        _queue = get_queue()
+        await _queue.start(lambda job_id: __import__("asyncio").run(run_job_async(job_id)))
+
+    print(f"API started — storage={settings.storage_backend} "
+          f"db={settings.database_url[:40]}... "
+          f"worker={settings.worker_mode}")
+    yield
+
+    # Shutdown
+    if _queue:
+        await _queue.stop()
+    await close_db()
 
 
-# ── app setup ────────────────────────────────────────────────────────────────
+# ── app ───────────────────────────────────────────────────────────────────────
+
+settings = get_settings()
 
 app = FastAPI(
-    title="Inria Building Segmentation API",
+    title=settings.app_name,
+    version=settings.app_version,
     description=(
-        "Binary building segmentation from aerial RGB imagery. "
-        "Upload a JPEG/PNG/GeoTIFF and receive a binary mask, overlay or GeoJSON vector polygons.\n\n"
-        "The model was trained on the Inria Aerial Image Labeling dataset at **0.3m/pixel**. "
-        "Supply `?resolution=` or use a georeferenced GeoTIFF for automatic resolution handling."
+        "Binary building segmentation from aerial imagery.\n\n"
+        "Three input modes: **upload** (multipart), **from-path** (local/mounted), "
+        "**from-url** (Azure Blob SAS or public URL).\n\n"
+        "Each has a sync variant (result returned directly) and an async variant "
+        "(returns job_id, poll `/jobs/{job_id}` for result).\n\n"
+        "Trained on Inria Aerial Image Labeling dataset at **0.3 m/pixel**."
     ),
-    version="1.3.0",
+    lifespan=lifespan,
 )
 
-# ── model singleton ──────────────────────────────────────────────────────────
 
-CHECKPOINT_PATH = Path("checkpoints/best_model.pth")
-CONFIG_PATH = Path("configs/config.yaml")
+# ── singletons ────────────────────────────────────────────────────────────────
 
-_inference: Optional[SegmentationInference] = None
+_model:   Optional[SegmentationInference] = None
+_storage = None
 
 
-def get_inference() -> SegmentationInference:
-    global _inference
-    if _inference is None:
-        if not CHECKPOINT_PATH.exists():
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Model checkpoint not found at '{CHECKPOINT_PATH}'. "
-                    "Train the model first with: python train.py"
-                ),
-            )
-        _inference = SegmentationInference(
-            checkpoint_path=str(CHECKPOINT_PATH),
-            config_path=str(CONFIG_PATH),
+def get_model() -> SegmentationInference:
+    global _model
+    if _model is None:
+        _model = SegmentationInference(
+            checkpoint_path=settings.checkpoint_path,
+            config_path=settings.config_path,
         )
-    return _inference
+    return _model
 
 
-# ── shared helpers ──────────────────────────────────────────────────────────────────
+def get_storage_backend():
+    global _storage
+    if _storage is None:
+        _storage = get_storage()
+    return _storage
 
-async def load_upload(file: UploadFile) -> tuple[np.ndarray, Optional[float]]:
+
+# ── auth dependency ───────────────────────────────────────────────────────────
+
+async def get_user_id(x_api_key: Optional[str] = Header(None)) -> str:
     """
-    Read an uploaded file -> (HWC uint8 RGB array, auto_resolution or None).
-    Raises HTTP 422 on unsupported format or decode error.
-    """
-    data = await file.read()
-    try:
-        image, auto_resolution = read_image_bytes(data, filename=file.filename or "")
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Cannot decode image: {e}")
-    return image, auto_resolution
- 
- 
-def resolution_headers(info: ResolutionInfo) -> dict:
-    """Build response headers from a ResolutionInfo object."""
-    headers = {}
-    if info.input_resolution is not None:
-        headers["X-Input-Resolution"] = f"{info.input_resolution:.4f}"
-    headers["X-Resampling-Applied"] = "true" if info.resampled else "false"
-    if info.resampled and info.resampled_to is not None:
-        headers["X-Resampled-To"] = f"{info.resampled_to:.4f}"
-    if info.warning:
-        headers["X-Resolution-Warning"] = info.warning
-    return headers
-    
+    Extract user_id from request.
 
-def mask_to_png_bytes(mask: np.ndarray) -> bytes:
-    """Binary mask (H, W bool/uint8) -> PNG bytes."""
-    img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    Local single-user: API_KEY is empty → always returns DEFAULT_USER_ID.
+    Production: API_KEY is set → validate header, return key as user_id.
+
+    In a real multi-user system you'd validate a JWT here instead and
+    extract the user ID from the token claims.
+    """
+    if settings.api_key:
+        if x_api_key != settings.api_key:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header.")
+        return x_api_key   # use key as user_id; replace with JWT sub claim in production
+    return settings.default_user_id
+
+
+# ── inference helpers ─────────────────────────────────────────────────────────
+
+def _build_params(p: InferenceParams) -> dict:
+    return {
+        "resolution":         p.resolution,
+        "resample":           p.resample,
+        "processing":         p.processing,
+        "result_type":        p.result_type,
+        "simplify_tolerance": p.simplify_tolerance,
+        "min_area":           p.min_area,
+    }
+
+
+def _run_inference_sync(
+    image: np.ndarray,
+    params: dict,
+    auto_resolution: Optional[float] = None,
+) -> tuple[bytes, ResolutionInfo, str]:
+    """
+    Run the full inference pipeline synchronously.
+    Returns (result_bytes, resolution_info, result_type).
+    """
+    model = get_model()
+
+    eff_res     = params.get("resolution") or auto_resolution
+    result_type = params.get("result_type", ResultType.MASK)
+    processing  = params.get("processing", "raw")
+    simplify    = params.get("simplify_tolerance", 0.5)
+    min_area    = params.get("min_area", 10.0)
+
+    mask, info = model.predict(
+        image,
+        input_resolution=eff_res,
+        resample=params.get("resample", True),
+    )
+
+    H, W = image.shape[:2]
+
+    if result_type == ResultType.VECTOR:
+        geojson = vectorize(mask, resolution=eff_res,
+                            simplify_tolerance_m=simplify, min_area_m2=min_area)
+        return json.dumps(geojson).encode(), info, result_type
+
+    if processing == "clean":
+        geojson = vectorize(mask, resolution=eff_res,
+                            simplify_tolerance_m=simplify, min_area_m2=min_area)
+        mask    = polygons_to_mask(geojson, height=H, width=W)
+
+    if result_type == ResultType.OVERLAY:
+        if processing == "vectorized":
+            geojson   = vectorize(mask, resolution=eff_res,
+                                  simplify_tolerance_m=simplify, min_area_m2=min_area)
+            png_bytes = _vector_overlay(image, geojson)
+        else:
+            png_bytes = _raw_overlay(image.copy(), mask)
+        return png_bytes, info, result_type
+
+    # Default: mask PNG
+    return _mask_to_png(mask), info, result_type
+
+
+def _mask_to_png(mask: np.ndarray) -> bytes:
+    img = PILImage.fromarray((mask.astype(np.uint8) * 255), mode="L")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-    
-
-# def _raw_overlay(image: np.ndarray, mask: np.ndarray) -> bytes:
-#     """Original image with raw mask pixels highlighted in red."""
-
-#     overlay = image.copy()
-
-#     overlay[mask > 0] = np.clip(
-#         overlay[mask > 0].astype(int) * 0.5 + np.array([255, 50, 50]) * 0.5,
-#         0, 255,
-#     ).astype(np.uint8)
-#     buf = io.BytesIO()
-#     Image.fromarray(overlay, mode="RGB").save(buf, format="PNG")
-#     return buf.getvalue()
 
 
 def _raw_overlay(image: np.ndarray, mask: np.ndarray) -> bytes:
-    image[mask > 0] = np.clip(
-        image[mask > 0].astype(int) * 0.5
-        + np.array([255, 50, 50]) * 0.5,
-        0,
-        255,
+    overlay = image.copy()
+    overlay[mask > 0] = np.clip(
+        overlay[mask > 0].astype(int) * 0.5 + np.array([255, 50, 50]) * 0.5,
+        0, 255,
     ).astype(np.uint8)
-
     buf = io.BytesIO()
-    Image.fromarray(image, mode="RGB").save(buf, format="PNG")
+    PILImage.fromarray(overlay, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
 
- 
+
 def _vector_overlay(image: np.ndarray, geojson: dict) -> bytes:
-    """
-    Original image with simplified building polygon outlines drawn in red.
-    Uses PIL ImageDraw so polygon edges are clean vectors, not raster fills.
-    """
-    pil_img = Image.fromarray(image, mode="RGB").convert("RGBA")
-    overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+    pil_img = PILImage.fromarray(image, mode="RGB").convert("RGBA")
+    overlay = PILImage.new("RGBA", pil_img.size, (0, 0, 0, 0))
     draw    = ImageDraw.Draw(overlay)
- 
     for feature in geojson.get("features", []):
-        geom      = feature.get("geometry", {})
-        geom_type = geom.get("type", "")
-        coords    = geom.get("coordinates", [])
- 
-        if geom_type == "Polygon":
-            _draw_polygon_pil(draw, coords)
-        elif geom_type == "MultiPolygon":
+        geom   = feature.get("geometry", {})
+        coords = geom.get("coordinates", [])
+        if geom.get("type") == "Polygon":
+            _draw_poly(draw, coords)
+        elif geom.get("type") == "MultiPolygon":
             for ring in coords:
-                _draw_polygon_pil(draw, ring)
- 
-    result = Image.alpha_composite(pil_img, overlay).convert("RGB")
+                _draw_poly(draw, ring)
     buf = io.BytesIO()
-    result.save(buf, format="PNG")
+    PILImage.alpha_composite(pil_img, overlay).convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
- 
- 
-def _draw_polygon_pil(draw: ImageDraw.Draw, coords: list) -> None:
-    """Fill exterior in semi-transparent red, then punch holes in black."""
+
+
+def _clean_overlay(image: np.ndarray, geojson: dict, H: int, W: int) -> bytes:
+    clean_mask = polygons_to_mask(geojson, height=H, width=W)
+    return _raw_overlay(image.copy(), clean_mask)
+
+
+def _draw_poly(draw: ImageDraw.Draw, coords: list) -> None:
     if not coords:
         return
     exterior = [tuple(pt) for pt in coords[0]]
     if len(exterior) >= 3:
         draw.polygon(exterior, fill=(255, 50, 50, 120), outline=(255, 50, 50, 220))
-
     for hole in coords[1:]:
         pts = [tuple(pt) for pt in hole]
         if len(pts) >= 3:
             draw.polygon(pts, fill=(0, 0, 0, 0))
 
 
-def _clean_overlay(image: np.ndarray, geojson: dict, H: int, W: int) -> bytes:
-    """Rasterized clean mask pixels filled red on original image."""
-    clean_mask = polygons_to_mask(geojson, height=H, width=W)
-    return _raw_overlay(image, clean_mask)
+def _resolution_headers(info: ResolutionInfo) -> dict:
+    h = {}
+    if info.input_resolution is not None:
+        h["X-Input-Resolution"]   = f"{info.input_resolution:.4f}"
+    h["X-Resampling-Applied"]     = "true" if info.resampled else "false"
+    if info.resampled and info.resampled_to:
+        h["X-Resampled-To"]       = f"{info.resampled_to:.4f}"
+    if info.warning:
+        h["X-Resolution-Warning"] = info.warning
+    return h
 
 
-# ── shared query param docs ───────────────────────────────────────────────────
- 
-_RES_DOC = (
-    "Pixel resolution in **metres/pixel** (e.g. 0.15). "
-    "Auto-detected for GeoTIFF with embedded projected CRS. "
-    "Omit for JPEG/PNG if unknown."
-)
-_RESAMPLE_DOC = (
-    "Resample to training resolution (0.3m/px) if image is finer. Default true."
-)
-_SIMPLIFY_DOC = (
-    "Douglas-Peucker simplification tolerance in **metres**. "
-    "Controls straight-edge fitting on building outlines. Default 0.5m."
-)
-_MIN_AREA_DOC = (
-    "Minimum building footprint in **m2**. "
-    "Detections below this are discarded as noise. "
-    "Requires `resolution` to be known. Default 10.0 m2."
-)
- 
+def _result_media_type(result_type: str) -> str:
+    return "application/json" if result_type == ResultType.VECTOR else "image/png"
 
-# ── /predict ──────────────────────────────────────────────────────────────────
- 
-@app.post(
-    "/predict",
-    summary="Building mask PNG",
-    response_class=Response,
-    responses={200: {"content": {"image/png": {}}}},
-)
-async def predict(
-    file: UploadFile = File(..., description="Aerial image (JPEG, PNG, GeoTIFF)"),
-    processing: MaskProcessing = Query(
-        MaskProcessing.raw,
-        description=(
-            "**raw** — direct model output. "
-            "**clean** — vectorized (polygonized + simplified + filtered) "
-            "then rasterized back to pixels."
-        ),
-    ),
-    resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
-    resample: bool = Query(True, description=_RESAMPLE_DOC),
-    simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
-    min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
-):
-    """
-    Returns a **binary mask PNG** (white = building, black = background).
- 
-    - `processing=raw` (default): direct model output
-    - `processing=clean`: polygonized → simplified → rasterized back to pixels
-    """
-    image, auto_res = await load_upload(file)
-    eff_res = resolution if resolution is not None else auto_res
- 
-    model = get_inference()
-    mask, info = model.predict(image, input_resolution=eff_res, resample=resample)
- 
-    if processing == MaskProcessing.clean:
-        geojson    = vectorize(mask, resolution=eff_res,
-                               simplify_tolerance_m=simplify_tolerance,
-                               min_area_m2=min_area)
-        H, W       = image.shape[:2]
-        mask       = polygons_to_mask(geojson, height=H, width=W)
- 
+
+def _result_key(job_id: str, result_type: str) -> str:
+    ext = "json" if result_type == ResultType.VECTOR else "png"
+    return f"{job_id}.{ext}"
+
+
+# ── cache helper ──────────────────────────────────────────────────────────────
+
+async def _check_and_serve_cache(
+    session: AsyncSession,
+    input_hash: str,
+    result_type: str,
+) -> Optional[Response]:
+    """Return a cached Response if available, else None."""
+    if not settings.cache_enabled:
+        return None
+    cached = await get_cached_result(session, input_hash)
+    if not cached:
+        return None
+    storage = get_storage_backend()
+    data    = await storage.read(cached.result_path)
     return Response(
-        content=mask_to_png_bytes(mask),
-        media_type="image/png",
-        headers=resolution_headers(info),
+        content=data,
+        media_type=_result_media_type(result_type),
+        headers={"X-Cache": "HIT"},
     )
- 
- 
-# ── /predict/overlay ──────────────────────────────────────────────────────────
- 
-@app.post(
-    "/predict/overlay",
-    summary="Building overlay PNG",
-    response_class=Response,
-    responses={200: {"content": {"image/png": {}}}},
-)
-async def predict_overlay(
-    file: UploadFile = File(..., description="Aerial image (JPEG, PNG, GeoTIFF)"),
-    processing: OverlayProcessing = Query(
-        OverlayProcessing.raw,
-        description=(
-            "**raw** — raw mask pixels filled red. "
-            "**vectorized** — clean simplified polygon outlines. "
-            "**clean** — vectorized then rasterized, filled red."
-        ),
-    ),
-    resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
-    resample: bool = Query(True, description=_RESAMPLE_DOC),
-    simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
-    min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
-):
-    """
-    Returns the original image with buildings highlighted.
- 
-    - `processing=raw` (default): raw mask pixels filled red
-    - `processing=vectorized`: clean simplified polygon outlines drawn
-    - `processing=clean`: vectorized → rasterized → filled red
-    """
-    image, auto_res = await load_upload(file)
-    eff_res = resolution if resolution is not None else auto_res
- 
-    model = get_inference()
-    mask, info = model.predict(image, input_resolution=eff_res, resample=resample)
- 
-    H, W = image.shape[:2]
- 
-    if processing == OverlayProcessing.raw:
-        png_bytes = _raw_overlay(image, mask)
- 
-    elif processing == OverlayProcessing.vectorized:
-        geojson   = vectorize(mask, resolution=eff_res,
-                              simplify_tolerance_m=simplify_tolerance,
-                              min_area_m2=min_area)
-        png_bytes = _vector_overlay(image, geojson)
- 
-    else:  # clean
-        geojson   = vectorize(mask, resolution=eff_res,
-                              simplify_tolerance_m=simplify_tolerance,
-                              min_area_m2=min_area)
-        png_bytes = _clean_overlay(image, geojson, H, W)
- 
-    return Response(
-        content=png_bytes,
-        media_type="image/png",
-        headers=resolution_headers(info),
-    )
- 
- 
-# ── /predict/vector ───────────────────────────────────────────────────────────
- 
-@app.post(
-    "/predict/vector",
-    summary="Building polygons GeoJSON",
-    response_class=JSONResponse,
-)
-async def predict_vector(
-    file: UploadFile = File(..., description="Aerial image (JPEG, PNG, GeoTIFF)"),
-    resolution: Optional[float] = Query(None, description=_RES_DOC, gt=0),
-    resample: bool = Query(True, description=_RESAMPLE_DOC),
-    simplify_tolerance: float = Query(0.5, description=_SIMPLIFY_DOC, gt=0),
-    min_area: float = Query(10.0, description=_MIN_AREA_DOC, gt=0),
-):
-    """
-    Returns a **GeoJSON FeatureCollection** of building polygons.
- 
-    Coordinates are in **pixel space** (col, row) of the original input image.
- 
-    Each feature has properties:
-    - `area_px`: polygon area in pixels²
-    - `area_m2`: real-world area in m² (only when resolution is known)
- 
-    The response `metadata` block records the parameters used
-    (n_buildings, resolution, simplify_tolerance, min_area).
-    """
-    image, auto_res = await load_upload(file)
-    eff_res = resolution if resolution is not None else auto_res
- 
-    model = get_inference()
-    mask, info = model.predict(image, input_resolution=eff_res, resample=resample)
- 
-    geojson = vectorize(
-        mask,
-        resolution=eff_res,
-        simplify_tolerance_m=simplify_tolerance,
-        min_area_m2=min_area,
-    )
- 
-    headers = resolution_headers(info)
-    headers["X-Building-Count"] = str(geojson["metadata"]["n_buildings"])
- 
-    return JSONResponse(content=geojson, headers=headers)
- 
- 
-# ── health ────────────────────────────────────────────────────────────────────
 
-@app.get("/health", summary="Health check")
-def health():
-    return {"status": "ok", "model_loaded": _inference is not None}
- 
+
+# ── sync inference + store ────────────────────────────────────────────────────
+
+async def _sync_predict_and_store(
+    session: AsyncSession,
+    image: np.ndarray,
+    params: dict,
+    auto_resolution: Optional[float],
+    user_id: str,
+    input_mode: str,
+    input_ref: str,
+    input_hash: Optional[str],
+) -> Response:
+    """Run inference, store result, log job, return Response."""
+    import uuid
+    from datetime import datetime, timezone
+
+    job_id = str(uuid.uuid4())
+    t0     = time.monotonic()
+
+    result_bytes, info, result_type = _run_inference_sync(image, params, auto_resolution)
+    duration = time.monotonic() - t0
+
+    storage     = get_storage_backend()
+    result_key  = _result_key(job_id, result_type)
+    await storage.write(result_key, result_bytes)
+
+    # Log job
+    job = await create_job(
+        session,
+        user_id=user_id,
+        input_mode=input_mode,
+        input_ref=input_ref,
+        params=params,
+        result_type=result_type,
+        input_hash=input_hash,
+    )
+    await mark_done(session, job.id, result_key, duration)
+
+    # Store cache entry
+    if input_hash and settings.cache_enabled:
+        await store_cached_result(session, input_hash, result_key, result_type)
+
+    headers = _resolution_headers(info)
+    headers["X-Job-Id"] = job.id
+    headers["X-Cache"]  = "MISS"
+
+    return Response(
+        content=result_bytes,
+        media_type=_result_media_type(result_type),
+        headers=headers,
+    )
+
+
+# ── input loading ─────────────────────────────────────────────────────────────
+
+async def _load_from_path(path: str) -> tuple[np.ndarray, Optional[float]]:
+    """Open a file directly — zero copy, no upload buffering."""
+    if not Path(path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found at path '{path}'. "
+                   "Ensure the file is mounted into the container at this path.",
+        )
+    try:
+        import rasterio
+        with rasterio.open(path) as src:
+            arr = src.read()
+            resolution = None
+            try:
+                if src.crs and src.crs.is_projected:
+                    res_x, res_y = src.res
+                    resolution   = float((res_x + res_y) / 2)
+            except Exception:
+                pass
+        image = _bands_to_rgb_uint8(arr)
+        del arr
+        return image, resolution
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Cannot open file: {e}")
+
+
+async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float]]:
+    """Download URL in chunks to temp file — never fully in RAM."""
+    try:
+        import httpx
+        import rasterio
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(1024 * 1024):
+                            f.write(chunk)
+
+            with rasterio.open(tmp_path) as src:
+                arr = src.read()
+                resolution = None
+                try:
+                    if src.crs and src.crs.is_projected:
+                        res_x, res_y = src.res
+                        resolution   = float((res_x + res_y) / 2)
+                except Exception:
+                    pass
+
+            image = _bands_to_rgb_uint8(arr)
+            del arr
+            return image, resolution
+        finally:
+            os.unlink(tmp_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Cannot download or open URL: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC ENDPOINTS — result returned directly
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/predict/upload", summary="Sync — multipart upload")
+async def predict_upload(
+    file:       UploadFile = File(...),
+    params:     InferenceParams = Depends(),
+    user_id:    str = Depends(get_user_id),
+    db:         AsyncSession = Depends(db_session_dependency),
+):
+    """Upload an image file and receive the result directly."""
+    data = await file.read()
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(413, detail=f"File exceeds {settings.max_upload_bytes // 1024**2}MB limit.")
+
+    try:
+        image, auto_res = read_image_bytes(data, filename=file.filename or "")
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e))
+
+    p = _build_params(params)
+    eff_res    = p.get("resolution") or auto_res
+    input_hash = compute_input_hash(hash_bytes(data), p)
+    del data
+
+    cached_response = await _check_and_serve_cache(db, input_hash, p["result_type"])
+    if cached_response:
+        return cached_response
+
+    return await _sync_predict_and_store(
+        db, image, p, auto_res, user_id,
+        InputMode.UPLOAD, file.filename or "upload", input_hash,
+    )
+
+
+@app.post("/predict/from-path", summary="Sync — local file path")
+async def predict_from_path(
+    body:    FromPathRequest,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """
+    Open a file directly from the container filesystem.
+    Best for large tiles — zero upload buffering, rasterio reads straight from disk.
+
+    The file must be accessible at `body.path` inside the container.
+    Mount your data directory via the `volumes` section in docker-compose.
+    """
+    p = _build_params(body)
+
+    # Cache key uses path + mtime so cache invalidates when file changes
+    try:
+        mtime = str(Path(body.path).stat().st_mtime)
+    except Exception:
+        mtime = ""
+    input_hash = compute_input_hash(f"{body.path}:{mtime}", p)
+
+    cached_response = await _check_and_serve_cache(db, input_hash, p["result_type"])
+    if cached_response:
+        return cached_response
+
+    image, auto_res = await _load_from_path(body.path)
+    return await _sync_predict_and_store(
+        db, image, p, auto_res, user_id,
+        InputMode.PATH, body.path, input_hash,
+    )
+
+
+@app.post("/predict/from-url", summary="Sync — download from URL")
+async def predict_from_url(
+    body:    FromUrlRequest,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """
+    Download an image from a URL and return the result directly.
+    Suitable for Azure Blob SAS URLs or any publicly accessible image.
+    Downloaded in chunks to minimise peak RAM.
+    """
+    p = _build_params(body)
+    input_hash = compute_input_hash(body.url, p)
+
+    cached_response = await _check_and_serve_cache(db, input_hash, p["result_type"])
+    if cached_response:
+        return cached_response
+
+    image, auto_res = await _load_from_url(body.url)
+    return await _sync_predict_and_store(
+        db, image, p, auto_res, user_id,
+        InputMode.URL, body.url, input_hash,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASYNC ENDPOINTS — returns job_id immediately
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _enqueue(
+    session:    AsyncSession,
+    user_id:    str,
+    input_mode: str,
+    input_ref:  str,
+    params:     dict,
+    input_hash: Optional[str] = None,
+) -> AsyncJobAccepted:
+    """Create job in DB, enqueue, return accepted response."""
+    job = await create_job(
+        session,
+        user_id=user_id,
+        input_mode=input_mode,
+        input_ref=input_ref,
+        params=params,
+        result_type=params.get("result_type", ResultType.MASK),
+        input_hash=input_hash,
+    )
+    await session.commit()   # commit before enqueue so worker can find the job
+
+    if _queue:
+        await _queue.enqueue(job.id)
+    else:
+        # Fallback: run inline (shouldn't happen in normal operation)
+        import asyncio
+        asyncio.create_task(run_job_async(job.id))
+
+    return AsyncJobAccepted(
+        job_id=job.id,
+        poll_url=f"/jobs/{job.id}",
+    )
+
+
+@app.post("/predict/async/upload",
+          response_model=AsyncJobAccepted,
+          summary="Async — multipart upload",
+          status_code=202)
+async def predict_async_upload(
+    file:    UploadFile = File(...),
+    params:  InferenceParams = Depends(),
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """Upload a file and receive a job_id. Poll /jobs/{job_id} for result."""
+    data = await file.read()
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(413, detail="File too large.")
+
+    # Store upload in storage so worker can retrieve it
+    storage     = get_storage_backend()
+    upload_key  = f"uploads/{hash_bytes(data)}/{file.filename or 'upload'}"
+    await storage.write(upload_key, data)
+
+    p = _build_params(params)
+    return await _enqueue(
+        db, user_id, InputMode.UPLOAD, upload_key, p, hash_bytes(data)
+    )
+
+
+@app.post("/predict/async/from-path",
+          response_model=AsyncJobAccepted,
+          summary="Async — local file path",
+          status_code=202)
+async def predict_async_from_path(
+    body:    FromPathRequest,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """Queue inference on a local path. Returns job_id immediately."""
+    if not Path(body.path).exists():
+        raise HTTPException(404, detail=f"File not found: {body.path}")
+    p = _build_params(body)
+    return await _enqueue(db, user_id, InputMode.PATH, body.path, p)
+
+
+@app.post("/predict/async/from-url",
+          response_model=AsyncJobAccepted,
+          summary="Async — download from URL",
+          status_code=202)
+async def predict_async_from_url(
+    body:    FromUrlRequest,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """Queue inference on a URL. Returns job_id immediately."""
+    p = _build_params(body)
+    return await _enqueue(db, user_id, InputMode.URL, body.url, p)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/jobs/{job_id}", response_model=JobResponse, summary="Get job status")
+async def get_job_status(
+    job_id:  str,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """Poll this endpoint after submitting an async job."""
+    job = await get_job(db, job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job {job_id} not found.")
+
+    result_url = None
+    if job.status == JobStatus.DONE and job.result_path:
+        storage    = get_storage_backend()
+        result_url = await storage.get_url(job.result_path)
+
+    d = job.to_dict()
+    d["result_url"] = result_url
+    d["cached"]     = False
+    return JobResponse(**d)
+
+
+@app.get("/jobs/{job_id}/result", summary="Download job result")
+async def get_job_result(
+    job_id:  str,
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """
+    Download the result for a completed job.
+
+    Local storage: streams the file from disk.
+    Azure storage: redirects to a time-limited SAS URL (client downloads
+                   directly from Azure — API never touches the bytes again).
+    """
+    from fastapi.responses import RedirectResponse
+
+    job = await get_job(db, job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job {job_id} not found.")
+    if job.status != JobStatus.DONE:
+        raise HTTPException(
+            409,
+            detail=f"Job is {job.status}, not done yet. Poll /jobs/{job_id} for status.",
+        )
+
+    storage = get_storage_backend()
+    url     = await storage.get_url(job.result_path)
+
+    if settings.storage_backend == "azure":
+        # Azure: redirect to SAS URL — zero bytes through the API
+        return RedirectResponse(url=url)
+
+    # Local: stream from disk
+    data = await storage.read(job.result_path)
+    return Response(
+        content=data,
+        media_type=_result_media_type(job.result_type),
+    )
+
+
+@app.get("/jobs/", summary="List recent jobs")
+async def list_recent_jobs(
+    limit:   int = Query(20, ge=1, le=100),
+    offset:  int = Query(0, ge=0),
+    user_id: str = Depends(get_user_id),
+    db:      AsyncSession = Depends(db_session_dependency),
+):
+    """List the most recent jobs for the current user."""
+    jobs = await list_jobs(db, user_id=user_id, limit=limit, offset=offset)
+    return [j.to_dict() for j in jobs]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCAL RESULT STREAMING
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/results/{key}", summary="Stream result file (local storage only)")
+async def get_result_file(key: str):
+    """
+    Stream a result file from local storage.
+    Only relevant when STORAGE_BACKEND=local.
+    In Azure mode, clients use the SAS URL returned by /jobs/{job_id}.
+    """
+    storage = get_storage_backend()
+    if not await storage.exists(key):
+        raise HTTPException(404, detail=f"Result '{key}' not found.")
+    data = await storage.read(key)
+    ext  = Path(key).suffix.lower()
+    media_type = "application/json" if ext == ".json" else "image/png"
+    return Response(content=data, media_type=media_type)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEALTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health", response_model=HealthResponse, summary="Health check")
+async def health(db: AsyncSession = Depends(db_session_dependency)):
+    """Check DB, storage, and model reachability."""
+    # DB
+    try:
+        from sqlalchemy import text
+        await db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    # Storage
+    try:
+        storage        = get_storage_backend()
+        storage_status = "ok" if await storage.health_check() else "error"
+    except Exception as e:
+        storage_status = f"error: {e}"
+
+    # Model
+    try:
+        get_model()
+        model_status = "ok"
+    except Exception as e:
+        model_status = f"error: {e}"
+
+    overall = "ok" if all(
+        s == "ok" for s in [db_status, storage_status, model_status]
+    ) else "degraded"
+
+    return HealthResponse(
+        status=overall,
+        database=db_status,
+        storage=storage_status,
+        model=model_status,
+    )
+
+
 @app.get("/", include_in_schema=False)
 def root():
-    return {"message": "Inria Building Segmentation API — see /docs for usage and info."}
- 
+    return {"message": f"{settings.app_name} — see /docs for usage."}
