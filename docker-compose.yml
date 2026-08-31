@@ -33,8 +33,6 @@ services:
       - DEFAULT_USER_ID=local
       # Optional: set to require X-API-Key header
       # - API_KEY=your-secret-key
-    depends_on:
-      - worker
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
