@@ -44,3 +44,6 @@ Thumbs.db
 # Docker
 #.dockerignore
 
+# results and db volumes
+volumes/results/
+volumes/db/
