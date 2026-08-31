@@ -44,9 +44,9 @@ services:
 
   # ── Worker ───────────────────────────────────────────────────────────────────
   # Same image as API, different CMD.
-  # In local/thread mode this is effectively a no-op (jobs run inside the API
-  # process) but the service is defined so switching to queue mode only
-  # requires changing WORKER_MODE=queue — no docker-compose changes.
+  # Not started in thread mode (jobs run inside the API process).
+  # Start with: docker compose --profile queue up
+  # when WORKER_MODE=queue for Azure Queue Storage.
   worker:
     image: inria-segmentation:latest
     container_name: inria_worker
