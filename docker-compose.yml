@@ -1,0 +1,84 @@
+services:
+
+  # ── API ─────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inria-segmentation:latest
+    container_name: inria_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Input data — mounted read-only so the from-path endpoint can open
+      # files directly with rasterio (no upload buffering)
+      - ${DATA_DIR:-./data/swisstopo}:/data:ro
+      # Results written by the API (sync endpoints) and worker (async)
+      - results_vol:/app/data/results
+      # SQLite DB — shared between api and worker containers
+      - db_vol:/app/db_data
+      # Checkpoint — mount so you can swap models without rebuilding
+      - ./checkpoints/best_model.pth:/app/checkpoints/best_model.pth:ro
+      - ./configs:/app/configs:ro
+    environment:
+      # Storage
+      - STORAGE_BACKEND=local
+      - STORAGE_LOCAL_ROOT=/app/data/results
+      # Database — stored on named volume so it persists across restarts
+      - DATABASE_URL=sqlite+aiosqlite:////app/db_data/jobs.db
+      # Worker mode — thread runs jobs inside this process
+      - WORKER_MODE=thread
+      - WORKER_THREADS=2
+      # Auth — single user local default
+      - DEFAULT_USER_ID=local
+      # Optional: set to require X-API-Key header
+      # - API_KEY=your-secret-key
+    depends_on:
+      - worker
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Worker ───────────────────────────────────────────────────────────────────
+  # Same image as API, different CMD.
+  # In local/thread mode this is effectively a no-op (jobs run inside the API
+  # process) but the service is defined so switching to queue mode only
+  # requires changing WORKER_MODE=queue — no docker-compose changes.
+  worker:
+    image: inria-segmentation:latest
+    container_name: inria_worker
+    command: ["python", "-m", "worker.job_runner"]
+    volumes:
+      - ${DATA_DIR:-./data/swisstopo}:/data:ro
+      - results_vol:/app/data/results
+      - db_vol:/app/db_data
+      - ./checkpoints/best_model.pth:/app/checkpoints/best_model.pth:ro
+      - ./configs:/app/configs:ro
+    environment:
+      - STORAGE_BACKEND=local
+      - STORAGE_LOCAL_ROOT=/app/data/results
+      - DATABASE_URL=sqlite+aiosqlite:////app/db_data/jobs.db
+      - WORKER_MODE=thread
+      - DEFAULT_USER_ID=local
+    restart: unless-stopped
+    # Worker doesn't expose ports — only the API does
+    profiles:
+      - queue   # only started when --profile queue is passed
+                # for thread mode, jobs run inside the api container
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  results_vol:
+    driver: local
+  db_vol:
+    driver: local
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  default:
+    name: inria_net
