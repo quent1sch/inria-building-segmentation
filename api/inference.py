@@ -50,6 +50,19 @@ Image format handling
   - Single-band (grayscale): replicated to 3 channels.
   - Plain images (JPEG, PNG, BMP, TIFF): read via Pillow.
   - GeoTIFF: read via rasterio (preserves 16-bit, reads metadata).
+
+Spatial metadata passthrough
+-----------------------------
+GeoTIFF files carry a CRS (coordinate reference system) and an affine
+transform (pixel → world coordinate mapping). These are captured in a
+SpatialRef dataclass and returned alongside the image array. They are
+NOT consumed by the inference pipeline — the model only sees uint8 RGB
+pixels. SpatialRef is passed through to the output layer (api/output.py)
+so results can be written as georeferenced GeoTIFFs with the same CRS
+and transform as the input, preserving spatial alignment for GIS use.
+
+Plain images (JPEG/PNG) return SpatialRef=None. The output layer falls
+back to plain PNG in that case unless the user explicitly requests TIFF.
 """
 
 import io
@@ -101,19 +114,47 @@ class ResolutionInfo:
     resampled: bool = False
     resampled_to: Optional[float] = None
     warning: Optional[str] = None
- 
+
+
+# ── spatial reference dataclass ──────────────────────────────────────────────
+
+@dataclass
+class SpatialRef:
+    """
+    CRS and affine transform extracted from a GeoTIFF input.
+
+    Passed through the pipeline unchanged — the model never sees it.
+    Consumed by api/output.py to write georeferenced GeoTIFF results.
+
+    Fields
+    ------
+    crs       : rasterio.crs.CRS — coordinate reference system (e.g. EPSG:2056)
+    transform : affine.Affine    — pixel (col, row) → world (x, y) mapping
+    width     : int              — original image width in pixels
+    height    : int              — original image height in pixels
+
+    Note: width/height are the ORIGINAL input dimensions. After resampling
+    the image passed to the model is smaller, but output.py needs the
+    original dimensions to write the result at the correct scale with the
+    correct transform.
+    """
+    crs:       object   # rasterio.crs.CRS
+    transform: object   # affine.Affine
+    width:     int
+    height:    int
  
 # ── image reading ─────────────────────────────────────────────────────────────
  
 def read_image_bytes(
     data: bytes,
     filename: str = "",
-) -> Tuple[np.ndarray, Optional[float]]:
+) -> Tuple[np.ndarray, Optional[float], Optional["SpatialRef"]]:
     """
-    Read raw file bytes -> (HWC uint8 RGB numpy array, resolution_m_per_px or None).
- 
-    For GeoTIFF files, attempts to extract pixel resolution from metadata.
-    For all other formats, resolution is None (must be supplied by the caller).
+    Read raw file bytes -> (HWC uint8 RGB numpy array, resolution_m_per_px or None, 
+    SpatialRef or None).
+
+    SpatialRef is populated for GeoTIFF files with a projected CRS.
+    It is None for plain images (JPEG/PNG) or TIFFs without CRS metadata.
  
     Handles:
       - 16-bit -> 8-bit normalisation
@@ -153,6 +194,15 @@ def read_image_bytes(
                     if src.crs and src.crs.is_projected:
                         res_x, res_y = src.res
                         auto_resolution = float((res_x + res_y) / 2)
+                        # Capture spatial metadata for georeferenced output.
+                        # width/height are original dims — needed by output.py
+                        # even if the image is later resampled for inference.
+                        spatial_ref = SpatialRef(
+                            crs=src.crs,
+                            transform=src.transform,
+                            width=src.width,
+                            height=src.height,
+                        )
                 except Exception:
                     pass
         finally:
@@ -174,7 +224,7 @@ def read_image_bytes(
         image = _bands_to_rgb_uint8(arr)
         del arr
  
-    return image, auto_resolution
+    return image, auto_resolution, spatial_ref
  
  
 def _bands_to_rgb_uint8(arr: np.ndarray) -> np.ndarray:

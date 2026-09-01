@@ -19,6 +19,37 @@ class InferenceParams(BaseModel):
     simplify_tolerance:  float           = Field(0.5,   gt=0, description="Douglas-Peucker tolerance in metres.")
     min_area:            float           = Field(10.0,  gt=0, description="Minimum building area in m².")
 
+    # ── output format ─────────────────────────────────────────────────────
+    # "auto": GeoTIFF if input was a GeoTIFF with embedded CRS, PNG otherwise.
+    # Explicit "tif" forces GeoTIFF output regardless of input format.
+    # Explicit "png" forces PNG even when spatial metadata is available.
+    # Note: GeoTIFF output preserves the input CRS and affine transform so
+    # the mask can be loaded directly in QGIS or any GIS tool.
+    output_format: Literal["auto", "png", "tif"] = Field(
+        "auto",
+        description=(
+            "Output file format. "
+            "'auto' = GeoTIFF if input had embedded CRS, PNG otherwise. "
+            "'tif' = always GeoTIFF (no CRS if input had none). "
+            "'png' = always PNG (spatial metadata discarded)."
+        ),
+    )
+
+    # ── vector coordinate space ───────────────────────────────────────────
+    # Only applies when result_type=vector.
+    # "auto": world coordinates if spatial_ref available, pixel otherwise.
+    # "world": CRS coordinates (metres in LV95, degrees in WGS84, etc.)
+    #          → GeoJSON loadable directly in QGIS, GeoPandas, etc.
+    # "pixel": (col, row) pixel coordinates (previous default behaviour).
+    coords: Literal["auto", "world", "pixel"] = Field(
+        "auto",
+        description=(
+            "Coordinate space for vector output (result_type=vector only). "
+            "'auto' = world coordinates if input had CRS, pixel otherwise. "
+            "'world' = real-world CRS coordinates. "
+            "'pixel' = pixel (col, row) coordinates."
+        ),
+    )
 
 # ── input mode request bodies ─────────────────────────────────────────────────
 

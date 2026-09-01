@@ -195,9 +195,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.inference import (
     SegmentationInference,
+    SpatialRef,
     _bands_to_rgb_uint8,
     read_image_bytes,
     ResolutionInfo,
+)
+from api.output import (
+    mask_to_bytes,
+    overlay_to_bytes,
+    vector_to_bytes,
+    resolve_output_format,
 )
 from api.schemas import (
     AsyncJobAccepted,
@@ -334,18 +341,33 @@ def _run_inference_sync(
     image: np.ndarray,
     params: dict,
     auto_resolution: Optional[float] = None,
-) -> tuple[bytes, ResolutionInfo, str]:
+    spatial_ref=None,
+) -> tuple[bytes, ResolutionInfo, str, str, str]:
     """
     Run the full inference pipeline synchronously.
-    Returns (result_bytes, resolution_info, result_type).
+
+    Parameters
+    ----------
+    spatial_ref : SpatialRef or None — passed through to api/output.py so
+                  results can be written as georeferenced GeoTIFF when the
+                  input was a GeoTIFF with embedded CRS.
+
+    Returns
+    -------
+    (result_bytes, resolution_info, result_type, media_type, file_extension)
+    media_type and file_extension are determined by output_format param and
+    whether spatial_ref is available — callers don't need to know what
+    format was actually used.
     """
     model = get_model()
 
-    eff_res     = params.get("resolution") or auto_resolution
-    result_type = params.get("result_type", ResultType.MASK)
-    processing  = params.get("processing", "raw")
-    simplify    = params.get("simplify_tolerance", 0.5)
-    min_area    = params.get("min_area", 10.0)
+    eff_res       = params.get("resolution") or auto_resolution
+    result_type   = params.get("result_type", ResultType.MASK)
+    processing    = params.get("processing", "raw")
+    simplify      = params.get("simplify_tolerance", 0.5)
+    min_area      = params.get("min_area", 10.0)
+    output_format = params.get("output_format", "auto")
+    coords        = params.get("coords", "auto")
 
     mask, info = model.predict(
         image,
@@ -356,26 +378,31 @@ def _run_inference_sync(
     H, W = image.shape[:2]
 
     if result_type == ResultType.VECTOR:
-        geojson = vectorize(mask, resolution=eff_res,
-                            simplify_tolerance_m=simplify, min_area_m2=min_area)
-        return json.dumps(geojson).encode(), info, result_type
+        # vector_to_bytes handles pixel→world coordinate conversion
+        # when spatial_ref is available and coords="auto"|"world"
+        data, media_type, ext = vector_to_bytes(
+            mask, spatial_ref, coords, simplify, min_area, eff_res
+        )
+        return data, info, result_type, media_type, ext
 
-    if processing == "clean":
+    geojson = None
+    if processing in ("clean", "vectorized"):
         geojson = vectorize(mask, resolution=eff_res,
                             simplify_tolerance_m=simplify, min_area_m2=min_area)
-        mask    = polygons_to_mask(geojson, height=H, width=W)
+    if processing == "clean":
+        mask = polygons_to_mask(geojson, height=H, width=W)
 
     if result_type == ResultType.OVERLAY:
-        if processing == "vectorized":
-            geojson   = vectorize(mask, resolution=eff_res,
-                                  simplify_tolerance_m=simplify, min_area_m2=min_area)
-            png_bytes = _vector_overlay(image, geojson)
-        else:
-            png_bytes = _raw_overlay(image.copy(), mask)
-        return png_bytes, info, result_type
+        # overlay_to_bytes writes GeoTIFF if output_format="auto"|"tif"
+        # and spatial_ref is available
+        data, media_type, ext = overlay_to_bytes(
+            image, mask, processing, geojson, spatial_ref, output_format
+        )
+        return data, info, result_type, media_type, ext
 
-    # Default: mask PNG
-    return _mask_to_png(mask), info, result_type
+    # Default: mask — mask_to_bytes writes GeoTIFF when appropriate
+    data, media_type, ext = mask_to_bytes(mask, spatial_ref, output_format)
+    return data, info, result_type, media_type, ext
 
 
 def _mask_to_png(mask: np.ndarray) -> bytes:
@@ -484,15 +511,23 @@ async def _sync_predict_and_store(
     input_mode: str,
     input_ref: str,
     input_hash: Optional[str],
+    spatial_ref=None,
 ) -> Response:
-    """Run inference, store result, log job, return Response."""
+    """
+    Run inference, store result, log job, return Response.
+
+    spatial_ref is passed through to _run_inference_sync so output.py
+    can write georeferenced GeoTIFF results when the input was a GeoTIFF.
+    """
     import uuid
     from datetime import datetime, timezone
 
     job_id = str(uuid.uuid4())
     t0     = time.monotonic()
 
-    result_bytes, info, result_type = _run_inference_sync(image, params, auto_resolution)
+    result_bytes, info, result_type, media_type, ext = _run_inference_sync(
+        image, params, auto_resolution, spatial_ref
+    )
     duration = time.monotonic() - t0
 
     storage     = get_storage_backend()
@@ -516,20 +551,31 @@ async def _sync_predict_and_store(
         await store_cached_result(session, input_hash, result_key, result_type)
 
     headers = _resolution_headers(info)
-    headers["X-Job-Id"] = job.id
-    headers["X-Cache"]  = "MISS"
+    headers["X-Job-Id"]            = job.id
+    headers["X-Cache"]             = "MISS"
+    headers["X-Output-Format"]     = ext.lstrip(".")
+    # Hint the correct filename extension so curl/browsers save with right extension
+    headers["Content-Disposition"] = f'attachment; filename="result{ext}"'
+    if spatial_ref is not None:
+        epsg = spatial_ref.crs.to_epsg()
+        if epsg:
+            headers["X-Output-CRS"] = f"EPSG:{epsg}"
 
     return Response(
         content=result_bytes,
-        media_type=_result_media_type(result_type),
+        media_type=media_type,
         headers=headers,
     )
 
 
 # ── input loading ─────────────────────────────────────────────────────────────
 
-async def _load_from_path(path: str) -> tuple[np.ndarray, Optional[float]]:
-    """Open a file directly — zero copy, no upload buffering."""
+async def _load_from_path(path: str) -> tuple[np.ndarray, Optional[float], Optional[SpatialRef]]:
+    """
+    Open a file directly — zero copy, no upload buffering.
+    Returns (image, resolution, spatial_ref).
+    spatial_ref is populated for GeoTIFF with projected CRS, None otherwise.
+    """
     if not Path(path).exists():
         raise HTTPException(
             status_code=404,
@@ -538,6 +584,7 @@ async def _load_from_path(path: str) -> tuple[np.ndarray, Optional[float]]:
         )
     try:
         import rasterio
+        spatial_ref = None
         with rasterio.open(path) as src:
             arr = src.read()
             resolution = None
@@ -545,20 +592,32 @@ async def _load_from_path(path: str) -> tuple[np.ndarray, Optional[float]]:
                 if src.crs and src.crs.is_projected:
                     res_x, res_y = src.res
                     resolution   = float((res_x + res_y) / 2)
+                    # Capture CRS + transform for georeferenced output
+                    spatial_ref  = SpatialRef(
+                        crs=src.crs,
+                        transform=src.transform,
+                        width=src.width,
+                        height=src.height,
+                    )
             except Exception:
                 pass
         image = _bands_to_rgb_uint8(arr)
         del arr
-        return image, resolution
+        return image, resolution, spatial_ref
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Cannot open file: {e}")
 
 
-async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float]]:
-    """Download URL in chunks to temp file — never fully in RAM."""
+async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float], Optional[SpatialRef]]:
+    """
+    Download URL in chunks to temp file — never fully in RAM.
+    Returns (image, resolution, spatial_ref).
+    spatial_ref populated for GeoTIFF with projected CRS, None otherwise.
+    """
     try:
         import httpx
         import rasterio
+        from api.inference import SpatialRef
 
         with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
             tmp_path = tmp.name
@@ -571,6 +630,7 @@ async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float]]:
                         async for chunk in resp.aiter_bytes(1024 * 1024):
                             f.write(chunk)
 
+            spatial_ref = None
             with rasterio.open(tmp_path) as src:
                 arr = src.read()
                 resolution = None
@@ -578,12 +638,18 @@ async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float]]:
                     if src.crs and src.crs.is_projected:
                         res_x, res_y = src.res
                         resolution   = float((res_x + res_y) / 2)
+                        spatial_ref  = SpatialRef(
+                            crs=src.crs,
+                            transform=src.transform,
+                            width=src.width,
+                            height=src.height,
+                        )
                 except Exception:
                     pass
 
             image = _bands_to_rgb_uint8(arr)
             del arr
-            return image, resolution
+            return image, resolution, spatial_ref
         finally:
             os.unlink(tmp_path)
     except HTTPException:
