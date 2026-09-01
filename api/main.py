@@ -45,6 +45,22 @@ Applies to:
   result_type=overlay → processing=raw (default) | vectorized | clean
   result_type=vector  → always vectorized (no processing param)
 
+Output file format
+------------------
+  output_format=auto  (default)
+      GeoTIFF input with CRS → GeoTIFF output (CRS + transform preserved)
+      Plain JPEG/PNG input   → PNG output
+  output_format=tif   Force GeoTIFF regardless of input
+  output_format=png   Force PNG regardless of input (spatial metadata discarded)
+
+  For result_type=vector:
+  coords=auto   (default)
+      GeoTIFF with CRS → GeoJSON in world coordinates (metres in LV95, etc.)
+                         Loadable directly in QGIS, GeoPandas, etc.
+      Plain image      → GeoJSON in pixel coordinates (col, row)
+  coords=world  Force world coordinates (requires CRS)
+  coords=pixel  Force pixel coordinates (previous default behaviour)
+
 Processing parameters (all input mode endpoints)
 -------------------------------------------------
   resolution=0.15          metres/pixel of the input image.
@@ -132,17 +148,29 @@ Examples — sync upload
 
 Examples — from-path (best for large tiles, no upload buffering)
 -----------------------------------------------------------------
-  # Raw mask — file mounted at /data in container
-  curl -X POST http://localhost:8000/predict/from-path \
-       -H "Content-Type: application/json" \
-       -d '{"path": "/data/swissimage_2494-1114.tif"}' \
+  # Raw mask — GeoTIFF in → GeoTIFF out by default (CRS preserved)
+  curl -X POST http://localhost:8000/predict/from-path \\
+       -H "Content-Type: application/json" \\
+       -d '{"path": "/data/swissimage_2494-1114.tif"}' \\
+       --output mask.tif
+
+  # Force PNG output even though input is GeoTIFF
+  curl -X POST http://localhost:8000/predict/from-path \\
+       -H "Content-Type: application/json" \\
+       -d '{"path": "/data/swissimage_2494-1114.tif", "output_format": "png"}' \\
        --output mask.png
 
-  # Clean mask with explicit resolution (SWISSIMAGE is 0.1m/px)
-  curl -X POST http://localhost:8000/predict/from-path \
-       -H "Content-Type: application/json" \
-       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "processing": "clean"}' \
-       --output mask_clean.png
+  # Clean mask with explicit resolution (SWISSIMAGE is 0.1m/px) → GeoTIFF
+  curl -X POST http://localhost:8000/predict/from-path \\
+       -H "Content-Type: application/json" \\
+       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "processing": "clean"}' \\
+       --output mask_clean.tif
+
+  # GeoJSON in world coordinates (LV95 metres) — loadable in QGIS directly
+  curl -X POST http://localhost:8000/predict/from-path \\
+       -H "Content-Type: application/json" \\
+       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "result_type": "vector"}' \\
+       --output buildings_lv95.geojson
 
 Examples — from-url (Azure Blob SAS or public URL)
 ---------------------------------------------------
@@ -638,6 +666,7 @@ async def _load_from_url(url: str) -> tuple[np.ndarray, Optional[float], Optiona
                     if src.crs and src.crs.is_projected:
                         res_x, res_y = src.res
                         resolution   = float((res_x + res_y) / 2)
+                        # Capture CRS + transform for georeferenced output
                         spatial_ref  = SpatialRef(
                             crs=src.crs,
                             transform=src.transform,
@@ -675,7 +704,7 @@ async def predict_upload(
         raise HTTPException(413, detail=f"File exceeds {settings.max_upload_bytes // 1024**2}MB limit.")
 
     try:
-        image, auto_res = read_image_bytes(data, filename=file.filename or "")
+        image, auto_res, spatial_ref = read_image_bytes(data, filename=file.filename or "")
     except ValueError as e:
         raise HTTPException(422, detail=str(e))
 
@@ -691,6 +720,7 @@ async def predict_upload(
     return await _sync_predict_and_store(
         db, image, p, auto_res, user_id,
         InputMode.UPLOAD, file.filename or "upload", input_hash,
+        spatial_ref=spatial_ref,
     )
 
 
@@ -720,10 +750,11 @@ async def predict_from_path(
     if cached_response:
         return cached_response
 
-    image, auto_res = await _load_from_path(body.path)
+    image, auto_res, spatial_ref = await _load_from_path(body.path)
     return await _sync_predict_and_store(
         db, image, p, auto_res, user_id,
         InputMode.PATH, body.path, input_hash,
+        spatial_ref=spatial_ref,
     )
 
 
@@ -745,10 +776,11 @@ async def predict_from_url(
     if cached_response:
         return cached_response
 
-    image, auto_res = await _load_from_url(body.url)
+    image, auto_res, spatial_ref = await _load_from_url(body.url)
     return await _sync_predict_and_store(
         db, image, p, auto_res, user_id,
         InputMode.URL, body.url, input_hash,
+        spatial_ref=spatial_ref,
     )
 
 
