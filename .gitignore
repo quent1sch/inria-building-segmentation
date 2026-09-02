@@ -48,3 +48,9 @@ Thumbs.db
 # results and db volumes
 volumes/results/
 volumes/db/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
