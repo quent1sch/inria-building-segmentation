@@ -1,209 +1,233 @@
 """
 api/main.py
-
+ 
 FastAPI application — building segmentation as a service.
-
-Endpoints
----------
-Sync (returns result directly):
-  POST /predict/upload          multipart file upload — for small/medium images
-  POST /predict/from-path       path to file inside container (best for large tiles,
-                                zero upload buffering — rasterio opens direct from disk)
-  POST /predict/from-url        download from URL (Azure Blob SAS, public URL)
-                                streamed chunk by chunk to minimise peak RAM
-
-Async (returns job_id immediately, result fetched later):
+ 
+The model was trained on the Inria Aerial Image Labeling dataset at 0.3m/pixel.
+Input images are resampled to that resolution before inference when needed.
+Results are written in the same format as the input by default (GeoTIFF in →
+GeoTIFF out, preserving CRS and affine transform for direct GIS use).
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENDPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+Sync — result returned directly in the response body:
+  POST /predict/upload          multipart file upload (small/medium images)
+  POST /predict/from-path       open file directly from container filesystem
+                                (best for large tiles — zero upload buffering,
+                                rasterio reads straight from disk)
+  POST /predict/from-url        download from URL then run inference
+                                (Azure Blob SAS, public URL — streamed in chunks)
+ 
+Async — returns job_id immediately, result fetched separately:
   POST /predict/async/upload
   POST /predict/async/from-path
   POST /predict/async/from-url
-  → all return {"job_id": "...", "status": "queued", "poll_url": "/jobs/{job_id}"}
-
+  → 202 Accepted: {"job_id": "...", "status": "queued", "poll_url": "/jobs/{id}"}
+ 
 Job management:
-  GET  /jobs/{job_id}           job status + result URL when done
+  GET  /jobs/{job_id}           poll status; result_url populated when done
   GET  /jobs/{job_id}/result    stream result (local) or redirect to SAS URL (Azure)
-  GET  /jobs/                   list recent jobs for current user
-
-Results (local storage only):
-  GET  /results/{key}           stream result file from local storage
-                                (in Azure mode, clients use the SAS URL directly)
-
+  GET  /jobs/                   list recent jobs for the current user
+ 
+Local result streaming (STORAGE_BACKEND=local only):
+  GET  /results/{key}           stream a stored result file by key
+                                (Azure mode: clients use the presigned SAS URL directly)
+ 
 Health:
-  GET  /health                  DB + storage + model reachability
-
-Output processing levels
--------------------------
-  raw         Direct model output, thresholded.
-              → pixel-perfect but may have jagged edges and small artefacts
-  clean       Vectorized (polygonize → Douglas-Peucker simplify → area filter)
-              then rasterized back to a pixel mask.
-              → straight building edges, noise removed
-  vectorized  Vectorized polygon outlines drawn over the image.
-              → only meaningful for overlay / result_type=overlay
-
-Applies to:
-  result_type=mask    → processing=raw (default) | clean
-  result_type=overlay → processing=raw (default) | vectorized | clean
-  result_type=vector  → always vectorized (no processing param)
-
-Output file format
-------------------
-  output_format=auto  (default)
-      GeoTIFF input with CRS → GeoTIFF output (CRS + transform preserved)
-      Plain JPEG/PNG input   → PNG output
-  output_format=tif   Force GeoTIFF regardless of input
-  output_format=png   Force PNG regardless of input (spatial metadata discarded)
-
-  For result_type=vector:
-  coords=auto   (default)
-      GeoTIFF with CRS → GeoJSON in world coordinates (metres in LV95, etc.)
-                         Loadable directly in QGIS, GeoPandas, etc.
-      Plain image      → GeoJSON in pixel coordinates (col, row)
-  coords=world  Force world coordinates (requires CRS)
-  coords=pixel  Force pixel coordinates (previous default behaviour)
-
-Processing parameters (all input mode endpoints)
--------------------------------------------------
-  resolution=0.15          metres/pixel of the input image.
-                           Auto-detected for GeoTIFF with embedded projected CRS.
-                           Omit for JPEG/PNG if unknown — no resampling applied.
-
-  resample=false           Disable resampling for finer-than-training images.
-                           Default: true — images finer than 0.3m/px are
-                           resampled to 0.3m/px before inference.
-
-  processing=raw           Output processing level (see above).
-  result_type=mask         Output format: mask | overlay | vector
-
-  simplify_tolerance=0.5   Douglas-Peucker epsilon in metres.
-                           Only used when processing=clean or result_type=vector.
-                           Controls straight-edge fitting on building outlines.
-
-  min_area=10.0            Minimum building footprint in m².
-                           Detections below this threshold are discarded as noise.
+  GET  /health                  DB + storage backend + model reachability
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETERS  (JSON body for from-path/from-url; form fields for upload)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+Resolution:
+  resolution=<float>       Input resolution in metres/pixel.
+                           Auto-detected from GeoTIFF CRS metadata when available.
+                           Omit for JPEG/PNG if unknown — inference runs as-is.
+ 
+  resample=true|false      Resample finer-than-training images to 0.3m/px before
+                           inference. Default: true. Set false to skip resampling.
+                           Images coarser than 0.3m/px are never resampled — a
+                           warning is returned in the X-Resolution-Warning header.
+ 
+Result type (what you get back):
+  result_type=mask         Binary mask: white=building, black=background.  [default]
+  result_type=overlay      Original image with buildings highlighted in red.
+  result_type=vector       GeoJSON FeatureCollection of building polygons.
+ 
+Processing level (how the prediction is post-processed):
+  processing=raw           Direct model output, thresholded. Fast, pixel-accurate,
+                           but may have jagged edges and small spurious detections.
+                           Valid for: mask, overlay.                        [default]
+ 
+  processing=clean         Polygonize → Douglas-Peucker simplify → area filter →
+                           rasterize back to pixels. Straight building edges,
+                           noise removed. Slower than raw.
+                           Valid for: mask, overlay.
+ 
+  processing=vectorized    Simplified polygon outlines drawn over the image.
+                           Valid for: overlay only.
+ 
+  result_type=vector always runs the full vectorization pipeline regardless of
+  the processing param (which is ignored for vector output).
+ 
+Vectorization (used when processing=clean, processing=vectorized, or result_type=vector):
+  simplify_tolerance=0.5   Douglas-Peucker epsilon in metres. Controls how
+                           aggressively straight lines are fitted to building
+                           outlines. Higher = more simplified. Default: 0.5m.
+ 
+  min_area=10.0            Minimum building footprint in m². Detections below
+                           this are discarded as noise. Default: 10.0 m².
                            Requires resolution to be known.
-
-Response headers (when resolution is known)
--------------------------------------------
-  X-Input-Resolution    detected or supplied resolution in m/px
-  X-Resampling-Applied  "true" / "false"
-  X-Resampled-To        target resolution used (only when resampling applied)
-  X-Resolution-Warning  warning when input is coarser than training resolution
-  X-Job-Id              job ID logged in DB for every sync request
-  X-Cache               "HIT" if result served from cache, "MISS" otherwise
-
-Auth
-----
-  Single-user local:  API_KEY env var empty (default) → no auth required,
-                      all requests attributed to DEFAULT_USER_ID="local"
-  Multi-user / cloud: set API_KEY → all requests must include
-                      X-API-Key: <value> header
-                      (replace with JWT/Azure AD in a full production setup)
-
-Cloud migration — env vars only, zero code changes
-----------------------------------------------------
-  Local defaults (no config needed):
+ 
+Output file format:
+  output_format=auto       GeoTIFF input with CRS → GeoTIFF output (CRS +
+                           affine transform preserved, loadable in QGIS etc.).
+                           Plain JPEG/PNG input → PNG output.              [default]
+  output_format=tif        Force GeoTIFF output regardless of input.
+  output_format=png        Force PNG output (spatial metadata discarded).
+  (Not applicable for result_type=vector which always returns GeoJSON.)
+ 
+Vector coordinate space (result_type=vector only):
+  coords=auto              GeoTIFF with CRS → world coordinates (metres in
+                           LV95, degrees in WGS84, etc.) with a CRS member in
+                           the GeoJSON — loadable directly in QGIS/GeoPandas.
+                           Plain image → pixel coordinates (col, row).     [default]
+  coords=world             Force world coordinates (requires CRS in input).
+  coords=pixel             Force pixel (col, row) coordinates.
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE HEADERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+  X-Input-Resolution       detected or supplied resolution in m/px
+  X-Resampling-Applied     "true" / "false"
+  X-Resampled-To           target resolution used (only when resampling applied)
+  X-Resolution-Warning     set when input is coarser than training resolution
+  X-Output-Format          actual format used: "tif" or "png"
+  X-Output-CRS             EPSG code of output CRS (e.g. "EPSG:2056") when georeferenced
+  X-Job-Id                 DB job ID logged for every sync request
+  X-Cache                  "HIT" — result served from cache / "MISS" — freshly computed
+  X-Building-Count         number of polygons (async result headers only)
+  Content-Disposition      filename hint with correct extension (result.tif / result.png)
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AUTH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+  Local single-user:  API_KEY env var empty (default) → no auth required.
+                      All requests attributed to DEFAULT_USER_ID="local".
+  Multi-user / cloud: set API_KEY env var → requests must include header:
+                      X-API-Key: <value>
+                      (Replace with JWT/Azure AD token validation in production.)
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLOUD MIGRATION — env vars only, zero code changes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+  Local (defaults, no config needed):
     STORAGE_BACKEND=local
     DATABASE_URL=sqlite+aiosqlite:///jobs.db
-    WORKER_MODE=thread
-
+    WORKER_MODE=thread          # jobs run in-process thread pool
+ 
   Azure production:
     STORAGE_BACKEND=azure
     AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;...
     AZURE_STORAGE_CONTAINER=segmentation-results
     DATABASE_URL=postgresql+asyncpg://user:pass@host/dbname
-    WORKER_MODE=queue
+    WORKER_MODE=queue           # jobs run in separate worker container
     AZURE_QUEUE_CONNECTION_STRING=...
     AZURE_QUEUE_NAME=inference-jobs
-
-Usage
------
-  # Start locally
-  uvicorn api.main:app --reload --port 8000
-
-  # Via Docker
-  docker compose up
-
-Examples — sync upload
------------------------
-  # Raw mask (multipart upload)
-  curl -X POST http://localhost:8000/predict/upload \
-       -F "file=@tile.tif" --output mask.png
-
-  # Clean mask (vectorized → rasterized), with known resolution
-  curl -X POST "http://localhost:8000/predict/upload" \
-       -F "file=@tile.tif" \
-       -F "resolution=0.3" -F "processing=clean" \
-       --output mask_clean.png
-
-  # Overlay with polygon outlines
-  curl -X POST "http://localhost:8000/predict/upload" \
-       -F "file=@tile.tif" \
-       -F "result_type=overlay" -F "processing=vectorized" -F "resolution=0.3" \
-       --output overlay.png
-
-  # GeoJSON polygons
-  curl -X POST "http://localhost:8000/predict/upload" \
-       -F "file=@tile.tif" \
-       -F "result_type=vector" -F "resolution=0.3"
-
-Examples — from-path (best for large tiles, no upload buffering)
------------------------------------------------------------------
-  # Raw mask — GeoTIFF in → GeoTIFF out by default (CRS preserved)
-  curl -X POST http://localhost:8000/predict/from-path \\
-       -H "Content-Type: application/json" \\
-       -d '{"path": "/data/swissimage_2494-1114.tif"}' \\
-       --output mask.tif
-
-  # Force PNG output even though input is GeoTIFF
-  curl -X POST http://localhost:8000/predict/from-path \\
-       -H "Content-Type: application/json" \\
-       -d '{"path": "/data/swissimage_2494-1114.tif", "output_format": "png"}' \\
-       --output mask.png
-
-  # Clean mask with explicit resolution (SWISSIMAGE is 0.1m/px) → GeoTIFF
-  curl -X POST http://localhost:8000/predict/from-path \\
-       -H "Content-Type: application/json" \\
-       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "processing": "clean"}' \\
-       --output mask_clean.tif
-
-  # GeoJSON in world coordinates (LV95 metres) — loadable in QGIS directly
-  curl -X POST http://localhost:8000/predict/from-path \\
-       -H "Content-Type: application/json" \\
-       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1, "result_type": "vector"}' \\
-       --output buildings_lv95.geojson
-
-Examples — from-url (Azure Blob SAS or public URL)
----------------------------------------------------
-  curl -X POST http://localhost:8000/predict/from-url \
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+  uvicorn api.main:app --reload --port 8000   # local dev
+  docker compose up                           # Docker
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+The async/from-path pattern is the recommended approach for large GeoTIFF tiles
+(e.g. SWISSIMAGE 10k×10k at 0.1m/px). It returns immediately, processes in the
+background, and the result is a georeferenced GeoTIFF loadable in QGIS.
+ 
+-- Async: raw mask GeoTIFF (default output_format=auto → tif since input has CRS)
+  curl -s -X POST http://localhost:8000/predict/async/from-path \
        -H "Content-Type: application/json" \
-       -d '{"url": "https://mystorage.blob.core.windows.net/tiles/tile.tif?sas_token=..."}' \
-       --output mask.png
-
-Examples — async (large images, non-blocking)
----------------------------------------------
-  # Submit job
+       -d '{"path": "/data/swissimage_2494-1114.tif"}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['poll_url'])"
+  → /jobs/abc-123
+ 
+  curl http://localhost:8000/jobs/abc-123
+  → {"status": "done", "result_url": "/results/abc-123.tif", ...}
+ 
+  curl http://localhost:8000/jobs/abc-123/result --output mask.tif
+ 
+-- Async: clean mask GeoTIFF (postprocessed — straight edges, noise removed)
   curl -X POST http://localhost:8000/predict/async/from-path \
        -H "Content-Type: application/json" \
-       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1}' \
-  → {"job_id": "abc-123", "status": "queued", "poll_url": "/jobs/abc-123"}
-
-  # Poll status
-  curl http://localhost:8000/jobs/abc-123
-  → {"status": "done", "result_url": "/results/abc-123.png", ...}
-
-  # Download result
-  curl http://localhost:8000/jobs/abc-123/result --output mask.png
-
-  # Check headers for resampling info
-  curl -X POST http://localhost:8000/predict/from-path \
+       -d '{"path": "/data/swissimage_2494-1114.tif",
+            "resolution": 0.1, "processing": "clean"}' \
+  → poll /jobs/{id}, download → mask_clean.tif
+ 
+-- Async: overlay GeoTIFF with raw mask fill
+  curl -X POST http://localhost:8000/predict/async/from-path \
        -H "Content-Type: application/json" \
-       -d '{"path": "/data/tile.tif", "resolution": 0.1}' \
-       --output mask.png --dump-header -
-  → X-Input-Resolution: 0.1000
-    X-Resampling-Applied: true
-    X-Resampled-To: 0.3000
-    X-Job-Id: abc-123
+       -d '{"path": "/data/swissimage_2494-1114.tif",
+            "result_type": "overlay", "resolution": 0.1}' \
+  → poll /jobs/{id}, download → overlay_raw.tif
+ 
+-- Async: overlay GeoTIFF with clean polygon outlines
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif",
+            "result_type": "overlay", "processing": "vectorized", "resolution": 0.1}' \
+  → poll /jobs/{id}, download → overlay_vector.tif
+ 
+-- Async: GeoJSON in LV95 world coordinates (QGIS-ready, no pixel coords)
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif",
+            "result_type": "vector", "resolution": 0.1}' \
+  → poll /jobs/{id}, download → buildings_lv95.geojson
+  (coords=auto → world because input has CRS EPSG:2056)
+ 
+-- Async: GeoJSON in pixel coordinates (explicit override)
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif",
+            "result_type": "vector", "resolution": 0.1, "coords": "pixel"}' \
+  → poll /jobs/{id}, download → buildings_pixels.geojson
+ 
+-- Async: force PNG output even though input is GeoTIFF
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif", "output_format": "png"}' \
+  → poll /jobs/{id}, download → mask.png
+ 
+-- Sync upload (small images, external clients without filesystem access)
+  curl -X POST http://localhost:8000/predict/upload \
+       -F "file=@small_tile.tif" \
+       -F "result_type=overlay" -F "processing=clean" -F "resolution=0.3" \
+       --output overlay_clean.tif --dump-header -
+  → X-Output-Format: tif
+    X-Output-CRS: EPSG:2056
+    X-Resampling-Applied: false
     X-Cache: MISS
+ 
+-- Check if a result was cached (second identical request → HIT)
+  curl -X POST http://localhost:8000/predict/async/from-path \
+       -H "Content-Type: application/json" \
+       -d '{"path": "/data/swissimage_2494-1114.tif", "resolution": 0.1}'
+  → X-Cache: HIT  (result returned immediately, no inference)
+ 
+-- List recent jobs
+  curl http://localhost:8000/jobs/?limit=5
 """
 
 import io
