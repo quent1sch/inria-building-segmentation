@@ -73,6 +73,15 @@ Usage examples
        --eval pixel 
        --no-mlflow
 
+View results
+------------
+# MLflow UI — see both training and eval runs side by side
+mlflow ui --backend-store-uri sqlite:///mlruns.db --port 5000
+
+# Quick check without MLflow
+cat outputs/evaluation/metrics_pixel.json | python3 -m json.tool
+cat outputs/evaluation/report.md
+
 MLflow integration
 ------------------
 Evaluation results are logged to a NEW MLflow run (separate from the
