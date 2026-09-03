@@ -113,7 +113,10 @@ def generate_report(
 ) -> None:
     """
     Auto-generate a markdown report summarising all evaluation results.
-    Reads the JSON outputs from each module that was run.
+
+    Only reads JSON files for modules that were actually run in this session
+    (eval_modules list). This prevents stale files from a previous run of a
+    different model being silently included in the report.
     """
     lines = [
         "# Evaluation Report\n",
@@ -124,8 +127,10 @@ def generate_report(
     ]
 
     # ── pixel metrics ─────────────────────────────────────────────────────
+    # Gated on eval_modules — stale metrics_pixel.json from a previous run
+    # of a different model is ignored unless pixel was run this session.
     pixel_json = out_dir / "metrics_pixel.json"
-    if pixel_json.exists():
+    if "pixel" in eval_modules and pixel_json.exists():
         lines.append("## Pixel-level Metrics\n\n")
         data = json.loads(pixel_json.read_text())
         lines.append("| City | IoU (raw) | IoU (clean) | Dice (raw) | Dice (clean) |\n")
@@ -143,28 +148,58 @@ def generate_report(
         lines.append(f"| **Overall** | **{ov['iou']:.4f}** | | **{ov['dice']:.4f}** | |\n\n")
 
     # ── building metrics ──────────────────────────────────────────────────
+    # Updated to match the current metrics_building.py output structure:
+    # per_city[city] = {"raw": {...}, "clean": {...}}
+    # (old format was flat: per_city[city] = {"precision": ..., ...})
     building_json = out_dir / "metrics_building.json"
-    if building_json.exists():
+    if "building" in eval_modules and building_json.exists():
         lines.append("## Building-level Metrics\n\n")
         data = json.loads(building_json.read_text())
         lines.append(f"*IoU matching threshold: {data.get('iou_threshold', 0.5)}*\n\n")
-        lines.append("| City | Precision | Recall | F1 | Miss Rate |\n")
-        lines.append("|---|---|---|---|---|\n")
+        lines.append(
+            "| City | P (raw) | R (raw) | F1 (raw) | mIoU (raw) "
+            "| P (clean) | R (clean) | F1 (clean) | mIoU (clean) |\n"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|\n")
         for city, m in data["per_city"].items():
+            r = m.get("raw", {})
+            c = m.get("clean", {})
             lines.append(
-                f"| {city} | {m['precision']:.3f} | {m['recall']:.3f} "
-                f"| {m['f1']:.3f} | {m['miss_rate']:.3f} |\n"
+                f"| {city} "
+                f"| {r.get('precision', 0):.3f} | {r.get('recall', 0):.3f} "
+                f"| {r.get('f1', 0):.3f} | {r.get('mean_iou_matched', 0):.3f} "
+                f"| {c.get('precision', 0):.3f} | {c.get('recall', 0):.3f} "
+                f"| {c.get('f1', 0):.3f} | {c.get('mean_iou_matched', 0):.3f} |\n"
             )
         if data.get("overall"):
-            ov = data["overall"]
+            r = data["overall"].get("raw", {})
+            c = data["overall"].get("clean", {})
             lines.append(
-                f"| **Overall** | **{ov['precision']:.3f}** | **{ov['recall']:.3f}** "
-                f"| **{ov['f1']:.3f}** | **{ov['miss_rate']:.3f}** |\n\n"
+                f"| **Overall** "
+                f"| **{r.get('precision', 0):.3f}** | **{r.get('recall', 0):.3f}** "
+                f"| **{r.get('f1', 0):.3f}** | **{r.get('mean_iou_matched', 0):.3f}** "
+                f"| **{c.get('precision', 0):.3f}** | **{c.get('recall', 0):.3f}** "
+                f"| **{c.get('f1', 0):.3f}** | **{c.get('mean_iou_matched', 0):.3f}** |\n\n"
             )
+        # Size-stratified recall if available
+        ov_raw = data.get("overall", {}).get("raw", {})
+        if "by_size" in ov_raw:
+            lines.append("**Size-stratified recall (raw → clean):**\n\n")
+            lines.append("| Size | GT buildings | Detected (raw) | Recall (raw) | Detected (clean) | Recall (clean) |\n")
+            lines.append("|---|---|---|---|---|---|\n")
+            ov_clean = data.get("overall", {}).get("clean", {})
+            for label, rd in ov_raw["by_size"].items():
+                cd = ov_clean.get("by_size", {}).get(label, {})
+                lines.append(
+                    f"| {label} | {rd.get('n_gt', 0)} "
+                    f"| {rd.get('n_detected', 0)} | {rd.get('recall', 0):.3f} "
+                    f"| {cd.get('n_detected', 0)} | {cd.get('recall', 0):.3f} |\n"
+                )
+            lines.append("\n")
 
     # ── threshold analysis ────────────────────────────────────────────────
     thresh_json = out_dir / "threshold_analysis.json"
-    if thresh_json.exists():
+    if "threshold" in eval_modules and thresh_json.exists():
         lines.append("## Threshold Analysis\n\n")
         data = json.loads(thresh_json.read_text())
         lines.append(
@@ -176,13 +211,13 @@ def generate_report(
 
     # ── postprocessing sensitivity ────────────────────────────────────────
     postproc_json = out_dir / "postproc_sensitivity.json"
-    if postproc_json.exists():
+    if "postproc" in eval_modules and postproc_json.exists():
         lines.append("## Postprocessing Sensitivity\n\n")
         lines.append("![Postprocessing Sensitivity](postproc_sensitivity.png)\n\n")
 
     # ── resolution robustness ─────────────────────────────────────────────
     res_json = out_dir / "resolution_robustness.json"
-    if res_json.exists():
+    if "resolution" in eval_modules and res_json.exists():
         lines.append("## Resolution Robustness\n\n")
         data = json.loads(res_json.read_text())
         lines.append("| Condition | IoU | Dice | F1 |\n")
