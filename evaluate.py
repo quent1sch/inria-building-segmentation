@@ -28,6 +28,7 @@ Usage examples
       --mode inria
       --patches data/patches
       --cities vienna
+      --out-dir outputs/evaluation
  
   # Inria — pixel metrics only (fast)
   python evaluate.py
@@ -36,6 +37,7 @@ Usage examples
       --patches data/patches
       --cities vienna
       --eval pixel
+      --out-dir outputs/evaluation
  
   # Swisstopo custom — pixel + building + resolution
   python evaluate.py
@@ -45,6 +47,7 @@ Usage examples
       --gt path/to/swissTLM3D_2026_LV95_LN02.gdb
       --max-samples 3
       --eval resolution
+      --out-dir outputs/evaluation
 
   # Other...
   python evaluate.py 
@@ -54,6 +57,7 @@ Usage examples
         --gt data/swisstopo/swissTLM3D/swissTLM3D_2026_LV95_LN02.gdb 
         --max-samples 1 
         --eval resolution
+        --out-dir outputs/evaluation
  
   # Multiple cities, limit samples per city for speed
   python evaluate.py
@@ -63,6 +67,7 @@ Usage examples
       --cities vienna austin
       --max-per-city 50
       --eval pixel threshold
+      --out-dir outputs/evaluation
   
       
   # Skip MLflow logging (quick local run)
@@ -72,6 +77,7 @@ Usage examples
        --patches data/patches 
        --eval pixel 
        --no-mlflow
+       --out-dir outputs/evaluation
 
 View results
 ------------
