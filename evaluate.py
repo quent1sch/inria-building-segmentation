@@ -192,6 +192,19 @@ def parse_args():
     parser.add_argument("--config", default="configs/config.yaml",
                         help="Config file path")
 
+    # ── report ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip inference entirely. Read all JSON result files already "
+            "present in --out-dir and generate report.md + qualitative grid "
+            "from them. Use this after running modules separately across "
+            "multiple sessions. No model or checkpoint needed."
+        ),
+    )
+
     # ── MLflow ────────────────────────────────────────────────────────────
     parser.add_argument(
         "--no-mlflow",
@@ -438,12 +451,49 @@ def _log_to_mlflow(mlflow_run, module_name: str, results: dict, out_dir: Path) -
         log_artifact_if_exists("resolution_robustness.png")
         log_artifact_if_exists("resolution_robustness.csv")
 
+def _write_module_metadata(out_dir: Path, module_name: str, args) -> None:
+    """
+    Write a small metadata sidecar JSON for each module output so
+    generate_report() can detect if results from different checkpoints
+    are being mixed in the same out_dir.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    meta_path = out_dir / f".meta_{module_name}.json"
+    meta = {
+        "module":         module_name,
+        "checkpoint":     args.checkpoint,
+        "eval_mode":      args.mode,
+        "eval_cities":    getattr(args, "cities", None),
+        "max_per_city":   getattr(args, "max_per_city", None),
+        "generated_at":   datetime.now(timezone.utc).isoformat(),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
 
 def main():
     args = parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    out_dir = Path(args.out_dir)
+
+    # ── report-only mode: generate report from existing outputs, no inference ──
+    # This is the correct way to aggregate results from multiple separate
+    # module runs (e.g. pixel run Monday, building run Tuesday, threshold
+    # run Wednesday) into a single report.md.
+    if args.report_only:
+        from evaluation import visualisation
+        print(f"\\nGenerating report from existing results in: {out_dir}")
+        visualisation.generate_report(
+            out_dir=out_dir,
+            mode=args.mode,
+            checkpoint_path=args.checkpoint,
+        )
+        print("Done.")
+        return
 
     # ── load model ────────────────────────────────────────────────────────
     print(f"\\nLoading model from: {args.checkpoint}")
@@ -564,6 +614,10 @@ def main():
 
         module_results[module_name] = results
 
+        # Write metadata alongside each module's output so generate_report()
+        # can detect if files from different checkpoints are mixed.
+        _write_module_metadata(out_dir, module_name, args)
+
         # Log this module's results to MLflow immediately after it completes.
         # Logging per-module (not all at end) means partial results are
         # captured even if a later module crashes.
@@ -605,10 +659,11 @@ def main():
         visualisation.save_prediction_grid(s_list, qual_dir, city=city)
 
     # ── report ────────────────────────────────────────────────────────────
+    # generate_report reads all JSON files present in out_dir.
+    # No eval_modules filtering — the report covers everything available.
     visualisation.generate_report(
         out_dir=out_dir,
         mode=args.mode,
-        eval_modules=modules,
         checkpoint_path=args.checkpoint,
     )
 

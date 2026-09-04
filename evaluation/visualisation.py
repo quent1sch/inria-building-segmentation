@@ -108,29 +108,57 @@ def _make_overlay(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def generate_report(
     out_dir: Path,
     mode: str,
-    eval_modules: list[str],
     checkpoint_path: str,
 ) -> None:
     """
-    Auto-generate a markdown report summarising all evaluation results.
+    Auto-generate a markdown report from ALL evaluation JSON files present
+    in out_dir — regardless of when they were produced or which session
+    ran them.
 
-    Only reads JSON files for modules that were actually run in this session
-    (eval_modules list). This prevents stale files from a previous run of a
-    different model being silently included in the report.
+    This is the correct design: the report is a view over the output
+    directory, not a side effect of a specific run. Use --report-only in
+    evaluate.py to generate without running inference.
+
+    Checkpoint consistency check: reads .meta_*.json sidecar files written
+    by evaluate.py alongside each module output. If results from different
+    checkpoints are detected, a warning is included in the report header.
     """
+    import glob
+
+    # ── checkpoint consistency check ──────────────────────────────────────
+    meta_files  = list(out_dir.glob(".meta_*.json"))
+    checkpoints = set()
+    modules_found = []
+    for mf in meta_files:
+        try:
+            meta = json.loads(mf.read_text())
+            checkpoints.add(meta.get("checkpoint", "unknown"))
+            modules_found.append(meta.get("module", mf.stem))
+        except Exception:
+            pass
+
+    consistency_warning = ""
+    if len(checkpoints) > 1:
+        consistency_warning = (
+            "\\n> ⚠️ **Warning:** results in this report were produced by "
+            f"**different checkpoints**: {', '.join(f'`{c}`' for c in checkpoints)}. "
+            "Results may not be comparable.\\n"
+        )
+
     lines = [
-        "# Evaluation Report\n",
-        f"**Checkpoint:** `{checkpoint_path}`  \n",
-        f"**Mode:** {mode}  \n",
-        f"**Modules run:** {', '.join(eval_modules)}  \n\n",
-        "---\n",
+        "# Evaluation Report\\n",
+        f"**Checkpoint:** `{checkpoint_path}`  \\n",
+        f"**Mode:** {mode}  \\n",
     ]
+    if modules_found:
+        lines.append(f"**Modules available:** {', '.join(sorted(set(modules_found)))}  \\n")
+    if consistency_warning:
+        lines.append(consistency_warning)
+    lines.append("\\n---\\n")
 
     # ── pixel metrics ─────────────────────────────────────────────────────
-    # Gated on eval_modules — stale metrics_pixel.json from a previous run
-    # of a different model is ignored unless pixel was run this session.
     pixel_json = out_dir / "metrics_pixel.json"
-    if "pixel" in eval_modules and pixel_json.exists():
+    if pixel_json.exists():
         lines.append("## Pixel-level Metrics\n\n")
         data = json.loads(pixel_json.read_text())
         lines.append("| City | IoU (raw) | IoU (clean) | Dice (raw) | Dice (clean) |\n")
@@ -152,7 +180,7 @@ def generate_report(
     # per_city[city] = {"raw": {...}, "clean": {...}}
     # (old format was flat: per_city[city] = {"precision": ..., ...})
     building_json = out_dir / "metrics_building.json"
-    if "building" in eval_modules and building_json.exists():
+    if building_json.exists():
         lines.append("## Building-level Metrics\n\n")
         data = json.loads(building_json.read_text())
         lines.append(f"*IoU matching threshold: {data.get('iou_threshold', 0.5)}*\n\n")
@@ -199,7 +227,7 @@ def generate_report(
 
     # ── threshold analysis ────────────────────────────────────────────────
     thresh_json = out_dir / "threshold_analysis.json"
-    if "threshold" in eval_modules and thresh_json.exists():
+    if thresh_json.exists():
         lines.append("## Threshold Analysis\n\n")
         data = json.loads(thresh_json.read_text())
         lines.append(
@@ -211,13 +239,13 @@ def generate_report(
 
     # ── postprocessing sensitivity ────────────────────────────────────────
     postproc_json = out_dir / "postproc_sensitivity.json"
-    if "postproc" in eval_modules and postproc_json.exists():
+    if postproc_json.exists():
         lines.append("## Postprocessing Sensitivity\n\n")
         lines.append("![Postprocessing Sensitivity](postproc_sensitivity.png)\n\n")
 
     # ── resolution robustness ─────────────────────────────────────────────
     res_json = out_dir / "resolution_robustness.json"
-    if "resolution" in eval_modules and res_json.exists():
+    if res_json.exists():
         lines.append("## Resolution Robustness\n\n")
         data = json.loads(res_json.read_text())
         lines.append("| Condition | IoU | Dice | F1 |\n")
