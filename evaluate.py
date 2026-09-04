@@ -72,12 +72,19 @@ Usage examples
       
   # Skip MLflow logging (quick local run)
   python evaluate.py 
-       --checkpoint checkpoints/best_model.pth 
-       --mode inria 
-       --patches data/patches 
-       --eval pixel 
-       --no-mlflow
-       --out-dir outputs/evaluation
+      --checkpoint checkpoints/best_model.pth 
+      --mode inria 
+      --patches data/patches 
+      --eval pixel 
+      --no-mlflow
+
+  # Generate report from all existing results (no inference, no model needed).
+  # Use this after running modules separately across multiple sessions —
+  # the report aggregates whatever JSON files are present in --out-dir.
+  python evaluate.py 
+      --report-only 
+      --checkpoint checkpoints/best_model.pth 
+      --out-dir outputs/evaluation
 
 View results
 ------------
