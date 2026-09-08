@@ -1,132 +1,148 @@
 """
 evaluate.py
- 
+
 Evaluation pipeline for the Inria building segmentation model.
- 
+
 Runs any combination of evaluation modules independently so each can be
 executed separately on CPU in acceptable time.
- 
+
+Output directory
+----------------
+Results are written to --out-dir/{checkpoint_hash}/ automatically, where
+checkpoint_hash is the first 8 characters of the SHA256 of the checkpoint
+file (e.g. outputs/evaluation/abc123de/). This ensures results from
+different model versions never overwrite each other — no manual naming
+needed. The same hash subdir is used consistently across all module runs
+and the report, so all results in a given subdirectory are guaranteed to
+be from the same checkpoint.
+
 Modes
 -----
-  inria   — Inria Aerial Image Labeling dataset test tiles (patched PNG crops)
-  custom  — SWISSIMAGE GeoTIFF tiles + swissTLM3D vector ground truth
- 
+  inria   — Inria Aerial Image Labeling dataset (patched 512×512 PNG crops).
+            Ground truth is rasterized building masks.
+
+  custom  — SWISSIMAGE GeoTIFF tiles + swissTLM3D vector ground truth.
+            Resolution is auto-detected from GeoTIFF CRS metadata.
+            Ground truth is rasterized on-the-fly from TLM_GEBAEUDE_FOOTPRINT
+            polygons clipped to each tile's bounding box.
+
 Evaluation modules
 ------------------
-  pixel       Pixel-level IoU, Dice, Precision, Recall (raw vs clean)
-  building    Object-level detection metrics (polygon matching)
-  threshold   PR curve, ROC, optimal threshold sweep
-  postproc    Postprocessing parameter sensitivity (simplify + min_area)
-  resolution  Resolution robustness (native / resampled / simulated coarse)
-              — custom mode only, requires images with known resolution
- 
+  pixel       Pixel-level IoU, Dice, Precision, Recall.
+              Computes both raw (direct model output) and clean
+              (vectorized → rasterized) and shows the delta.
+
+  building    Object-level detection metrics via polygon matching (COCO-style,
+              IoU threshold 0.5). Reports Precision, Recall, F1, mean matched
+              IoU, miss rate, false alarm rate — for both raw and clean.
+              Size-stratified recall (small <50m², medium 50-500m², large >500m²)
+              when resolution is known.
+
+  threshold   Sweeps classification threshold 0.05→0.95. Outputs PR curve,
+              F1/IoU vs threshold chart, and the empirically optimal threshold.
+
+  postproc    Sensitivity analysis for Douglas-Peucker tolerance and min_area
+              filter. Primary metrics: building recall/F1. Secondary: pixel IoU
+              (expected to drop slightly — documented sanity check).
+
+  resolution  Resolution robustness: evaluates same model under native,
+              resampled (0.3m/px), and simulated coarser conditions.
+              Requires --mode custom (images with known resolution).
+
 Usage examples
 --------------
-  # Inria — all modules
-  python evaluate.py
-      --checkpoint checkpoints/best_model.pth
-      --mode inria
-      --patches data/patches
-      --cities vienna
+  # Inria — all modules (long, use Colab GPU or run per-module on CPU)
+  python evaluate.py \\
+      --checkpoint checkpoints/best_model.pth \\
+      --mode inria \\
+      --patches data/patches \\
+      --cities vienna \\
       --out-dir outputs/evaluation
- 
-  # Inria — pixel metrics only (fast)
-  python evaluate.py
-      --checkpoint checkpoints/best_model.pth
-      --mode inria
-      --patches data/patches
-      --cities vienna
-      --eval pixel
+
+  # Inria — pixel only, fast sanity check (10 samples)
+  python evaluate.py \\
+      --checkpoint checkpoints/best_model.pth \\
+      --mode inria \\
+      --patches data/patches \\
+      --cities vienna \\
+      --max-per-city 10 \\
+      --eval pixel \\
+      --no-mlflow \\
       --out-dir outputs/evaluation
- 
+
   # Swisstopo custom — pixel + building + resolution
-  python evaluate.py
-      --checkpoint checkpoints/best_model.pth
-      --mode custom
-      --images path/to/swissimage_tiles/
-      --gt path/to/swissTLM3D_2026_LV95_LN02.gdb
-      --max-samples 3
-      --eval resolution
+  python evaluate.py \\
+      --checkpoint checkpoints/best_model.pth \\
+      --mode custom \\
+      --images path/to/swissimage_tiles/ \\
+      --gt path/to/swissTLM3D_2026_LV95_LN02.gdb \\
+      --eval pixel building resolution \\
       --out-dir outputs/evaluation
 
-  # Other...
-  python evaluate.py 
-        --checkpoint checkpoints/best_model.pth 
-        --mode custom 
-        --images data/swisstopo/SWISSIMAGE/ 
-        --gt data/swisstopo/swissTLM3D/swissTLM3D_2026_LV95_LN02.gdb 
-        --max-samples 1 
-        --eval resolution
-        --out-dir outputs/evaluation
- 
-  # Multiple cities, limit samples per city for speed
-  python evaluate.py
-      --checkpoint checkpoints/best_model.pth
-      --mode inria
-      --patches data/patches
-      --cities vienna austin
-      --max-per-city 50
-      --eval pixel threshold
+  # Recommended CPU workflow: run modules separately across sessions.
+  # Each command appends to the same outputs/evaluation/abc123de/ dir.
+  python evaluate.py --checkpoint checkpoints/best_model.pth \\
+      --mode inria --patches data/patches --cities vienna \\
+      --max-per-city 200 --eval pixel --out-dir outputs/evaluation
+  python evaluate.py --checkpoint checkpoints/best_model.pth \\
+      --mode inria --patches data/patches --cities vienna \\
+      --max-per-city 200 --eval building --out-dir outputs/evaluation
+  python evaluate.py --checkpoint checkpoints/best_model.pth \\
+      --mode inria --patches data/patches --cities vienna \\
+      --max-per-city 200 --eval threshold --out-dir outputs/evaluation
+  python evaluate.py --checkpoint checkpoints/best_model.pth \\
+      --mode inria --patches data/patches --cities vienna \\
+      --max-per-city 50 --eval postproc --out-dir outputs/evaluation
+
+  # Generate the full report once all modules are done.
+  # Reads all JSON files in outputs/evaluation/abc123de/ and produces
+  # a single report.md covering all completed modules.
+  # --mode is still required (used in the report header).
+  python evaluate.py \\
+      --report-only \\
+      --checkpoint checkpoints/best_model.pth \\
+      --mode inria \\
       --out-dir outputs/evaluation
-  
-      
-  # Skip MLflow logging (quick local run)
-  python evaluate.py 
-      --checkpoint checkpoints/best_model.pth 
-      --mode inria 
-      --patches data/patches 
-      --eval pixel 
-      --no-mlflow
-
-  # Generate report from all existing results (no inference, no model needed).
-  # Use this after running modules separately across multiple sessions —
-  # the report aggregates whatever JSON files are present in --out-dir.
-  python evaluate.py 
-      --report-only 
-      --checkpoint checkpoints/best_model.pth 
-      --out-dir outputs/evaluation
-
-View results
-------------
-# MLflow UI — see both training and eval runs side by side
-mlflow ui --backend-store-uri sqlite:///mlruns.db --port 5000
-
-# Quick check without MLflow
-cat outputs/evaluation/metrics_pixel.json | python3 -m json.tool
-cat outputs/evaluation/report.md
+  # → report written to outputs/evaluation/abc123de/report.md
 
 MLflow integration
 ------------------
 Evaluation results are logged to a NEW MLflow run (separate from the
-training run) and linked back to it via a tag:
+training run) and linked back to it via a tag. This keeps training and
+evaluation cleanly separated in the MLflow UI while maintaining full
+traceability.
 
   Training run  [run_id: abc-123]
-    params: encoder, lr, epochs, ...
-    metrics: train_loss, val_iou, ... (per epoch)
+    params: encoder, lr, epochs, warmup_epochs, ...
+    metrics: train_loss, val_iou, lr_encoder, ... (per epoch)
     artifacts: best_model.pth
 
-  Evaluation run  [run_name: eval-inria-20260901-143022]
-    tag: training_run_id = abc-123      ← links to training run
-    tag: checkpoint = checkpoints/best_model.pth
-    tag: model_epoch = 42
-    params: eval_mode, eval_cities, eval_modules, ...
-    metrics:
-      eval.pixel.vienna.iou_raw         ← per city
-      eval.pixel.overall.iou_raw        ← aggregated
-      eval.pixel.overall.iou_clean
+  Evaluation run  [run_name: eval-20260901-143022]
+    tag: training_run_id    = abc-123     ← links to the training run
+    tag: eval_run           = true        ← filter eval runs in MLflow UI
+    tag: checkpoint         = checkpoints/best_model.pth
+    tag: checkpoint_hash    = abc123de
+    tag: model_epoch        = 42
+    tag: model_encoder      = resnet34
+    params: eval_mode, eval_cities, eval_modules, eval_max_per_city, ...
+    metrics (namespaced to avoid collision with training metrics):
+      eval.pixel.vienna.iou_raw          ← per city
+      eval.pixel.overall.iou_raw         ← aggregated
+      eval.pixel.overall.iou_clean       ← postprocessed
       eval.building.overall.precision_raw
+      eval.building.by_size.small.recall_raw
       eval.threshold.optimal_threshold
       eval.postproc.simplify.0_5.building_f1
       eval.resolution.resampled.iou
-    artifacts: metrics_pixel.json, threshold_analysis.png, report.md, ...
+    artifacts:
+      evaluation/pixel/metrics_pixel.json
+      evaluation/threshold/threshold_analysis.png
+      evaluation/qualitative/predictions_grid_vienna.png
+      evaluation/report.md
 
-This design keeps training and evaluation cleanly separated in MLflow
-while maintaining full traceability: every eval run tags the training
-run_id so you always know which model produced a given result.
-
-Use --no-mlflow to skip logging (fast local runs, CI, no tracking server).
+Use --no-mlflow to skip logging (fast local runs, no tracking server).
 """
- 
+
 import argparse
 import sys
 from datetime import datetime, timezone
@@ -134,19 +150,19 @@ from pathlib import Path
 
 import torch
 import yaml
- 
+
 AVAILABLE_MODULES = ["pixel", "building", "threshold", "postproc", "resolution"]
 INRIA_ONLY_MODULES = []
 CUSTOM_ONLY_MODULES = ["resolution"]
- 
- 
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Building segmentation evaluation pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
- 
+
     # ── required ──────────────────────────────────────────────────────────
     parser.add_argument(
         "--checkpoint", required=True,
@@ -156,7 +172,7 @@ def parse_args():
         "--mode", required=True, choices=["inria", "custom"],
         help="Data source: 'inria' (patched PNG crops) or 'custom' (SWISSIMAGE + TLM3D)",
     )
- 
+
     # ── eval modules ──────────────────────────────────────────────────────
     parser.add_argument(
         "--eval", nargs="+",
@@ -168,7 +184,7 @@ def parse_args():
             "'resolution' requires --mode custom."
         ),
     )
- 
+
     # ── inria mode ────────────────────────────────────────────────────────
     parser.add_argument("--patches", default="data/patches",
                         help="Patches directory (inria mode)")
@@ -176,7 +192,7 @@ def parse_args():
                         help="Cities to evaluate. Default: all cities in patches dir.")
     parser.add_argument("--max-per-city", type=int, default=None,
                         help="Max samples per city (for faster runs)")
- 
+
     # ── custom mode ───────────────────────────────────────────────────────
     parser.add_argument("--images", default=None,
                         help="Directory of SWISSIMAGE .tif tiles (custom mode)")
@@ -186,18 +202,22 @@ def parse_args():
                         help="GDB layer name for building footprints")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Max total samples (custom mode, for faster runs)")
- 
+
     # ── postprocessing params ─────────────────────────────────────────────
     parser.add_argument("--simplify-tolerance", type=float, default=0.5,
                         help="Douglas-Peucker epsilon in metres (default 0.5)")
     parser.add_argument("--min-area", type=float, default=10.0,
                         help="Minimum building area in m² (default 10.0)")
- 
+
     # ── output ────────────────────────────────────────────────────────────
     parser.add_argument("--out-dir", default="outputs/evaluation",
                         help="Output directory for results")
     parser.add_argument("--config", default="configs/config.yaml",
                         help="Config file path")
+
+    # ── output ───────────────────────────────────────────────────────────
+    # Note: the actual output subdirectory is determined automatically from
+    # the checkpoint hash (outputs/evaluation/{hash8}/) — no naming needed.
 
     # ── report ───────────────────────────────────────────────────────────
     parser.add_argument(
@@ -223,22 +243,21 @@ def parse_args():
             "report.md) are always written regardless of this flag."
         ),
     )
- 
+
     return parser.parse_args()
- 
- 
+
+
 def load_samples(args, cfg):
     """Build the sample iterable for the selected mode."""
     from evaluation.ground_truth import (
-        #InriaDataset,
         load_inria_samples,
         load_swissimage_samples,
     )
- 
+
     if args.mode == "inria":
         from data.dataset import InriaDataset
         patches_dir = Path(args.patches)
- 
+
         if args.cities:
             cities = args.cities
         else:
@@ -248,13 +267,13 @@ def load_samples(args, cfg):
             ]
             cities = sorted(cities)
             print(f"Auto-detected cities: {cities}")
- 
+
         return load_inria_samples(
             patches_dir,
             cities=cities,
             max_per_city=args.max_per_city,
         )
- 
+
     else:  # custom
         if not args.images:
             print("Error: --images is required for --mode custom", file=sys.stderr)
@@ -262,13 +281,14 @@ def load_samples(args, cfg):
         if not args.gt:
             print("Error: --gt is required for --mode custom", file=sys.stderr)
             sys.exit(1)
- 
+
         return load_swissimage_samples(
             images_dir=args.images,
             gdb_path=args.gt,
             gdb_layer=args.gt_layer,
             max_samples=args.max_samples,
         )
+
 
 # ── MLflow helpers ───────────────────────────────────────────────────────────
 
@@ -458,6 +478,24 @@ def _log_to_mlflow(mlflow_run, module_name: str, results: dict, out_dir: Path) -
         log_artifact_if_exists("resolution_robustness.png")
         log_artifact_if_exists("resolution_robustness.csv")
 
+
+def _checkpoint_hash(checkpoint_path: str) -> str:
+    """
+    Compute first 8 chars of SHA256 of the checkpoint file contents.
+    Used as a versioned subdirectory under out_dir so results from
+    different model versions never silently overwrite each other.
+
+    Example: outputs/evaluation/abc123de/metrics_pixel.json
+    """
+    import hashlib
+    h = hashlib.sha256()
+    with open(checkpoint_path, "rb") as f:
+        # Read in chunks — checkpoint files can be 100-500MB
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()[:8]
+
+
 def _write_module_metadata(out_dir: Path, module_name: str, args) -> None:
     """
     Write a small metadata sidecar JSON for each module output so
@@ -479,21 +517,38 @@ def _write_module_metadata(out_dir: Path, module_name: str, args) -> None:
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
+
 def main():
     args = parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    out_dir = Path(args.out_dir)
+    # ── resolve output directory ─────────────────────────────────────────
+    # Results go to out_dir/{checkpoint_hash}/ — a versioned subdirectory
+    # derived from the SHA256 of the checkpoint file contents (first 8 chars).
+    # This guarantees all JSON files in a given subdirectory came from the
+    # same model weights, with no risk of results from different training
+    # runs being mixed. No manual naming needed.
+    # Example: outputs/evaluation/abc123de/metrics_pixel.json
+    ckpt_hash = _checkpoint_hash(args.checkpoint)
+    out_dir   = Path(args.out_dir) / ckpt_hash
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── report-only mode: generate report from existing outputs, no inference ──
     # This is the correct way to aggregate results from multiple separate
     # module runs (e.g. pixel run Monday, building run Tuesday, threshold
     # run Wednesday) into a single report.md.
+    # All files in out_dir are guaranteed to be from the same checkpoint
+    # because the hash subdirectory is derived from the checkpoint file itself.
     if args.report_only:
         from evaluation import visualisation
-        print(f"\\nGenerating report from existing results in: {out_dir}")
+        print(f"\nCheckpoint hash : {ckpt_hash}")
+        print(f"Reading results from: {out_dir}")
+        if not any(out_dir.glob("*.json")):
+            print(f"  No result files found in {out_dir}.")
+            print(f"  Run evaluation modules first with --out-dir {Path(args.out_dir)}")
+            return
         visualisation.generate_report(
             out_dir=out_dir,
             mode=args.mode,
@@ -503,7 +558,7 @@ def main():
         return
 
     # ── load model ────────────────────────────────────────────────────────
-    print(f"\\nLoading model from: {args.checkpoint}")
+    print(f"\nLoading model from: {args.checkpoint}")
     from api.inference import SegmentationInference
     model = SegmentationInference(
         checkpoint_path=args.checkpoint,
@@ -524,12 +579,11 @@ def main():
             print(f"Warning: module '{m}' requires --mode custom — skipping.")
             modules = [x for x in modules if x != m]
 
-    print(f"Mode    : {args.mode}")
-    print(f"Modules : {modules}")
-    print(f"Out dir : {args.out_dir}")
-    print(f"MLflow  : {'disabled (--no-mlflow)' if args.no_mlflow else 'enabled'}\\n")
-
-    out_dir = Path(args.out_dir)
+    print(f"Mode              : {args.mode}")
+    print(f"Checkpoint hash   : {ckpt_hash}")
+    print(f"Modules           : {modules}")
+    print(f"Out dir           : {out_dir}")
+    print(f"MLflow            : {'disabled (--no-mlflow)' if args.no_mlflow else 'enabled'}\n")
 
     # ── resolve cities for inria mode (needed for MLflow params) ─────────
     if args.mode == "inria":
@@ -560,13 +614,14 @@ def main():
 
         # Log eval-level params — what data and setup was used
         mlflow.log_params({
-            "eval_mode":           args.mode,
-            "eval_cities":         str(cities),
-            "eval_modules":        str(modules),
-            "eval_max_per_city":   str(args.max_per_city),
-            "eval_simplify_tol":   args.simplify_tolerance,
-            "eval_min_area":       args.min_area,
-            "eval_checkpoint":     args.checkpoint,
+            "eval_checkpoint_hash": ckpt_hash,
+            "eval_mode":            args.mode,
+            "eval_cities":          str(cities),
+            "eval_modules":         str(modules),
+            "eval_max_per_city":    str(args.max_per_city),
+            "eval_simplify_tol":    args.simplify_tolerance,
+            "eval_min_area":        args.min_area,
+            "eval_checkpoint":      args.checkpoint,
         })
         print(f"MLflow eval run: {mlflow_run.info.run_id}")
         if "training_run_id" in tags:
@@ -580,7 +635,7 @@ def main():
     module_results: dict[str, dict] = {}
 
     for module_name in modules:
-        print(f"\\n{'='*60}")
+        print(f"\n{'='*60}")
         print(f"  Module: {module_name.upper()}")
         print(f"{'='*60}")
 
@@ -632,7 +687,7 @@ def main():
             _log_to_mlflow(mlflow_run, module_name, results, out_dir)
 
     # ── qualitative grid ──────────────────────────────────────────────────
-    print(f"\\n{'='*60}")
+    print(f"\n{'='*60}")
     print(f"  Module: QUALITATIVE GRID")
     print(f"{'='*60}")
 
@@ -687,12 +742,12 @@ def main():
             mlflow.log_artifact(str(report_path), artifact_path="evaluation")
 
         mlflow.end_run()
-        print(f"\\nMLflow eval run complete: {mlflow_run.info.run_id}")
+        print(f"\nMLflow eval run complete: {mlflow_run.info.run_id}")
         print(f"  View: mlflow ui --backend-store-uri {cfg['mlflow']['tracking_uri']} --port 5000")
 
-    print(f"\\n{'='*60}")
+    print(f"\n{'='*60}")
     print(f"  Evaluation complete. Results in: {out_dir}")
-    print(f"{'='*60}\\n")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
