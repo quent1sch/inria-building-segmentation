@@ -343,7 +343,7 @@ def generate_report(
         )
         thr_png = thr_dir / "threshold_analysis.png"
         if thr_png.exists():
-            lines.append(f"![Threshold Analysis](threshold_{thr_dir.name}/threshold_analysis.png)\n\n")
+            lines.append(f"![Threshold Analysis]({thr_dir.name}/threshold_analysis.png)\n\n")
 
     # ── postprocessing sensitivity ────────────────────────────────────────
     pp_dir, pp_meta = _resolve_module_dir("postproc")
@@ -362,7 +362,7 @@ def generate_report(
         lines.append(_eval_context_line(pp_meta))
         pp_png = pp_dir / "postproc_sensitivity.png"
         if pp_png.exists():
-            lines.append(f"![Postprocessing Sensitivity](postproc_{pp_dir.name}/postproc_sensitivity.png)\n\n")
+            lines.append(f"![Postprocessing Sensitivity]({pp_dir.name}/postproc_sensitivity.png)\n\n")
 
     # ── resolution robustness ─────────────────────────────────────────────
     res_dir, res_meta = _resolve_module_dir("resolution")
@@ -392,7 +392,7 @@ def generate_report(
         lines.append("\n")
         res_png = res_dir / "resolution_robustness.png"
         if res_png.exists():
-            lines.append(f"![Resolution Robustness](resolution_{res_dir.name}/resolution_robustness.png)\n\n")
+            lines.append(f"![Resolution Robustness]({res_dir.name}/resolution_robustness.png)\n\n")
 
     # ── qualitative ───────────────────────────────────────────────────────
     qual_dir = ckpt_dir / "qualitative"
